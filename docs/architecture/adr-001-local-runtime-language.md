@@ -7,7 +7,7 @@
 
 ## Decision
 
-Implement the DeepSeek++-owned Local Coding Runtime as a Rust native binary, distributed with a self-contained, signed installer/update bundle. Keep the browser extension, DeepSeek Web session, existing authorization path, MCP/native envelope, and model-facing tool semantics in the existing TypeScript spine.
+Implement the DeepSeek++-owned Local Coding Runtime as a Rust native binary, eventually distributed with a self-contained, signed installer/update bundle. Keep the browser extension, DeepSeek Web session, existing authorization path, Native Messaging transport infrastructure, and model-facing tool semantics in the existing TypeScript spine. P1 uses a development registration and does not require production signing or update infrastructure.
 
 The binary is an execution subordinate. It never selects a model, calls a paid API, owns an agent loop, or becomes a second authorization/router authority. The official DeepSeek Web session remains the only model/reasoning path. Local Runtime availability is an optional capability: if the host is absent, incompatible, or upgrading, the web session remains usable and reports a bounded local-capability error.
 
@@ -17,7 +17,7 @@ The first implementation should use `portable-pty` for the PTY abstraction (vers
 
 The current repository already has a public `deepseek-pp-shell-host` package (`node >=18.17`) and a Native Messaging implementation. The host uses a dependency-free `.mjs` payload, `child_process`, sentinel-delimited persistent sessions, and bounded retained output. That is a useful compatibility and fallback reference, but it deliberately does not provide a real PTY or a complete process-tree containment model. The extension-side native transport already owns the `deepseek-pp-mcp-native` v1 envelope, request correlation, timeout/abort behavior, and the approximately 1 MiB Native Messaging limit.
 
-The decision therefore targets the missing execution substrate, not a browser-stack rewrite. The Rust binary will initially speak the existing envelope and will be installed behind the existing host name (`com.deepseek_pp.shell`) so the TypeScript side does not gain a second transport authority.
+The decision therefore targets the missing execution substrate, not a browser-stack rewrite. The Rust binary will initially reuse the existing Native Messaging framing, browser transport, request correlation, and size limits, but it will speak a dedicated, discriminated `deepseek-pp-local-runtime` v1 contract. P1 uses an isolated canary host identity (`com.deepseek_pp.runtime.canary`). The released `com.deepseek_pp.shell` host and its catalog remain unchanged; any later migration is a separate compatibility decision.
 
 ## Alternatives considered
 
@@ -46,7 +46,7 @@ No third candidate is included. Python would not materially dominate either cand
 
 | Criterion | TypeScript/Node packaged | Rust native binary | Decision implication |
 | --- | --- | --- | --- |
-| Chrome/Edge/Firefox Native Messaging | Straightforward stdio framing; already implemented | Same 4-byte native-endian length + UTF-8 JSON; no browser change | Tie; preserve existing envelope |
+| Chrome/Edge/Firefox Native Messaging | Straightforward stdio framing; already implemented | Same 4-byte native-endian length + UTF-8 JSON; no browser change | Tie; reuse framing/transport, not semantic authority |
 | Windows-first canary / macOS / Linux | Easy host bootstrap; native features need per-platform addons | Cross-compile explicit targets; native OS APIs are first-class | Rust wins for long-term parity |
 | ConPTY and POSIX PTY | Requires native addon and ABI packaging | `portable-pty` abstraction plus platform adapters | Rust wins |
 | Cancellation and process trees | Child cancellation is easy; descendant cleanup is not | Job Objects/process groups can be owned and tested directly | Rust wins |
@@ -66,7 +66,7 @@ No third candidate is included. Python would not materially dominate either cand
 
 - Chrome documents Native Messaging as a separate host process over stdin/stdout, with UTF-8 JSON preceded by a 32-bit native-endian length; the documented host-to-browser message ceiling is 1 MiB and the browser-to-host ceiling is 64 MiB: <https://developer.chrome.com/docs/extensions/develop/concepts/native-messaging>.
 - Mozilla documents the host manifest, extension permission, browser-specific registration, and the fact that the browser does not install/manage the native application: <https://developer.mozilla.org/en-US/docs/Mozilla/Add-ons/WebExtensions/Native_messaging>.
-- The baseline repository's `core/mcp/native-contract.ts` defines `deepseek-pp-mcp-native` version 1. `core/mcp/transports/native.ts` validates the existing native host, correlates responses, aborts timed-out calls, and bounds payloads. `packages/shell-host/native/framing.mjs` implements the same 4-byte framing. These are the compatibility points for the Rust host.
+- The baseline repository's `core/mcp/native-contract.ts` defines `deepseek-pp-mcp-native` version 1. That contract carries caller-selected `server.command`, `args`, `cwd`, and `env` for generic MCP stdio launching; it is not the semantic authority for the new Coding Runtime. `core/mcp/transports/native.ts` and `packages/shell-host/native/framing.mjs` provide reusable browser transport, request correlation, abort, size-limit, and 4-byte framing compatibility points only.
 - The baseline `packages/shell-host/native/contracts.mjs` documents `MAX_OUTPUT_BYTES = 128000`, a 1 MiB native-message limit, and the deliberate no-native-dependency persistent-session design. The baseline `package.json` pins `@earendil-works/pi-agent-core` and `@earendil-works/pi-ai` at 0.83.0; this ADR does not upgrade them.
 
 ### Local Windows spike
@@ -117,23 +117,24 @@ Files are kept in the research workspace under `work/spikes/` and are not produc
 
 1. DeepSeek Web remains the model/reasoning authority.
 2. The extension's existing background-owned grant and tool router remain the only authorization/execution entry point. Content scripts and model-declared metadata cannot authorize a native call.
-3. The existing TypeScript native transport sends the v1 envelope to `com.deepseek_pp.shell`; the Rust host validates protocol/version/request shape again at its trust boundary.
-4. The Rust host owns only local execution: PTY/process lifecycle, workspace filesystem operations, bounded result collection, structured diagnostics, and host health.
-5. Responses carry stable request IDs, exit/cancellation status, byte counts, retained output, and an explicit `overflowed`/`more_available` indicator. The host must never silently discard data or imply that a bounded result is complete.
+3. The existing TypeScript Native Messaging transport sends the dedicated runtime contract to `com.deepseek_pp.runtime.canary` for P1; the Rust host validates protocol/version/request shape again at its trust boundary. The released `com.deepseek_pp.shell` host is not replaced or registered over.
+4. The new runtime contract is not a generic MCP launcher contract. It is a discriminated, versioned operation set. P1 command execution uses host-owned canary command profiles plus the background authorization grant; browser-supplied `server.command`, `args`, `cwd`, and `env` fields do not grant launch authority. General arbitrary-command profiles require a later explicit contract/authorization decision.
+5. The Rust host owns only local execution: PTY/process lifecycle, workspace filesystem operations, bounded result collection, structured diagnostics, and host health.
+6. Responses carry stable request IDs, exit/cancellation status, byte counts, retained output, and an explicit `overflowed`/`more_available` indicator. The host must never silently discard data or imply that a bounded result is complete.
 
 ### Schema sharing
 
-Keep the existing envelope and tool names for compatibility. Before P1 implementation, introduce one language-neutral, versioned JSON Schema source for the new runtime request/response subset. Generate TypeScript types/validators and Rust serde types/validators from that schema in CI; generated code is not hand-edited. Keep the existing TypeScript contract constants as the compatibility facade until the generated schema is adopted by the current tests. Add golden JSON fixtures consumed by both sides.
+Reuse the existing Native Messaging framing, browser transport, request correlation, size limits, and compatibility fixtures, but do not reuse `deepseek-pp-mcp-native` v1 as the new runtime's semantic authority. Before P1 implementation, introduce one language-neutral, versioned JSON Schema source for `deepseek-pp-local-runtime` v1. The schema is a discriminated operation contract (initially `runtime.status` and a host-owned canary `runtime.exec` profile), not a generic `server.command/args/cwd/env` launcher shape. Generate TypeScript types/validators and Rust serde types/validators from that schema in CI; generated code is not hand-edited. Keep the existing TypeScript contract constants as the transport compatibility facade and add golden JSON fixtures consumed by both sides.
 
-The initial schema must include `protocol`, `version`, `request_id`, `operation`, `workspace`, `argv` (never a shell-interpolated command for the structured exec operation), `timeout_ms`, `max_output_bytes`, and result provenance. Unknown future versions fail closed; unknown fields follow the existing compatibility policy and are tested explicitly.
+The initial schema must include `protocol`, `version`, `request_id`, `operation`, an authorization/grant reference, a logical workspace identifier, a host-owned command-profile identifier, `timeout_ms`, `max_output_bytes`, and result provenance. It must not expose the generic MCP launch fields as authority. Unknown future versions fail closed; unknown fields follow the existing compatibility policy and are tested explicitly. If a later contract carries command arguments, they are payload bound to a background-issued grant and an allowlisted profile, never authorization evidence by themselves.
 
 ### Installer/update model
 
-- Build signed per-platform bundles containing the Rust executable, browser host manifest, and installer metadata. Windows uses the existing per-browser HKCU Native Messaging registration model; macOS/Linux use their documented per-browser manifest locations.
+- Production model: build signed per-platform bundles containing the Rust executable, browser host manifest, and installer metadata. Windows uses the existing per-browser HKCU Native Messaging registration model; macOS/Linux use their documented per-browser manifest locations.
 - Install to a versioned application-data directory, stage the new bundle, verify signature/hash and manifest paths, then atomically switch a small current-version pointer. Retain one last-known-good version for rollback. Do not overwrite a running host in place.
 - The installer must not require Node, Python, uv, pipx, Git, or an npm global install. External coding tools remain user-selected capabilities, not hidden runtime prerequisites.
 - Use compatibility negotiation in the host health response. Extension updates and host updates can roll independently while the official Web session continues if local capability negotiation fails.
-- Windows release artifacts must be Authenticode-signed; macOS artifacts must be codesigned/notarized. Linux packaging can begin with a signed tar/AppImage-style bundle and an explicit distro support matrix, then add native package formats only when update ownership is clear.
+- Production release gates: Windows artifacts must be Authenticode-signed; macOS artifacts must be codesigned/notarized. Linux packaging can begin with a signed tar/AppImage-style bundle and an explicit distro support matrix, then add native package formats only when update ownership is clear. These are not P1 blockers unless credentials are already available under current authority.
 
 ### Security-critical filesystem policy
 
@@ -158,7 +159,7 @@ Record exact commit SHAs for any dependency or copied excerpt in the implementat
 
 ## Migration and reversal cost
 
-The stable v1 envelope, host name, tool names, and TypeScript authorization path keep reversal bounded. If the Rust canary fails, ship the last-known-good Node host bundle under the same registration, or disable only the local capability; no model/session data migration is needed and DeepSeek Web inference is unaffected. The main irrecoverable cost is Rust CI/signing/toolchain investment and any Rust-specific implementation. Keeping the protocol schema language-neutral avoids coupling user data or browser code to either implementation.
+The stable Native Messaging framing, TypeScript transport infrastructure, and existing authorization path keep reversal bounded; the new runtime semantic contract is intentionally separate from the generic MCP v1 contract. If the Rust canary fails, disable only `com.deepseek_pp.runtime.canary` and leave the released `com.deepseek_pp.shell` host untouched; no model/session data migration is needed and DeepSeek Web inference is unaffected. A later migration to the released host name requires a separately scoped full backward-compatibility decision. The main irrecoverable cost is Rust CI/signing/toolchain investment and any Rust-specific implementation. Keeping the runtime schema language-neutral avoids coupling user data or browser code to either implementation.
 
 Do not run both implementations concurrently for one host name. A staged installer may retain a rollback artifact, but the registry/pointer must select exactly one active host.
 
@@ -166,28 +167,30 @@ Do not run both implementations concurrently for one host name. A staged install
 
 P1 is the smallest end-to-end proof, not the full runtime:
 
-1. A signed Windows x64 Rust host binary speaking the existing Native Messaging framing and `deepseek-pp-mcp-native` v1 envelope.
-2. A two-operation catalog: `runtime.status` and `runtime.exec`. `runtime.exec` accepts an argv array, an extension-authorized workspace root, timeout, and output budget; it streams bounded stdout/stderr and returns truthful exit, timeout, cancellation, and overflow metadata.
+1. A reproducible Windows x64 Rust host artifact with SHA-256 and build provenance, speaking the existing Native Messaging framing but a dedicated `deepseek-pp-local-runtime` v1 contract. Production signing is not required for this slice.
+2. An isolated development registration for `com.deepseek_pp.runtime.canary`; the released `com.deepseek_pp.shell` registration and behavior remain unchanged.
+3. A two-operation catalog: `runtime.status` and a host-owned canary `runtime.exec` profile. The operation accepts only the background authorization/grant reference, logical workspace identity, profile ID, timeout, and output budget; it streams bounded stdout/stderr and returns truthful exit, timeout, cancellation, and overflow metadata.
 3. A PTY-backed canary command on Windows (ConPTY) and the closest available POSIX CI target, plus process-tree teardown tests using a child that spawns a descendant.
 4. Workspace read/write canaries: reject a path escaping through a junction/symlink/reparse point, and replace a file atomically within the workspace.
 5. The existing TypeScript transport and background authorization path call the host; a real DeepSeek Web dogfood turn observes the authorized result and continues the same session. No direct content-script-to-host path is permitted.
-6. A self-contained installer can install, status-check, upgrade, rollback, and unregister the host without a separately installed Node/Python runtime. Produce signed/size-stamped Windows artifacts in CI.
+6. A development install/register/status/unregister path can install the canary without a separately installed Node/Python runtime. Produce a hash-stamped, reproducible Windows artifact in CI. Production signing, update, rollback, and cross-platform installer UX remain P4/productization/release gates.
 
 P1 acceptance criteria:
 
-- Native framing and schema golden tests pass for valid, malformed, oversized, future-version, timeout, cancellation, and overflow responses.
+- Native framing and dedicated runtime-schema golden tests pass for valid, malformed, oversized, future-version, timeout, cancellation, and overflow responses; generic `deepseek-pp-mcp-native` v1 launcher fields cannot authorize the new runtime.
+- The canary host is registered under `com.deepseek_pp.runtime.canary`; released `com.deepseek_pp.shell` behavior and catalog tests remain unchanged.
 - A command cannot run outside the authorized workspace after canonical/reparse resolution; the junction escape test fails closed.
 - Cancellation and timeout leave no owned descendant process, or return an explicit teardown failure that blocks success.
 - Retained output never exceeds the requested budget; `more_available=true` and byte counts are truthful when data was dropped.
 - The TypeScript extension sees the same request ID and continuation semantics through the existing grant/router; no provider, prompt, model, WXT, or `pi-agent-core` contract changes are made.
-- `npm run compile`, `npm run prompt:freeze`, affected browser builds, manifest/UTF-8 checks, the focused native-host suite, and `npm run ci:quality` (with unrelated/pre-existing failures separated) are recorded before Architect Review.
+- `npm run compile`, `npm run prompt:freeze`, affected browser builds, manifest/UTF-8 checks, the focused native-host suite, and `npm run ci:quality` (with unrelated/pre-existing failures separated) are recorded before Architect Review. P1 does not require production signing credentials.
 
 ## Unresolved risks and follow-ups
 
 - Current research could not link a Rust executable or run a real ConPTY session because the Windows environment lacks `link.exe`; CI must supply this evidence.
 - `portable-pty` provides the PTY abstraction, not the complete DeepSeek++ security policy. Job Object assignment, reparse-point handling, output limits, and teardown verification remain product-owned code.
 - Windows network shares, mount points, junctions, POSIX bind mounts, and malicious concurrent renames need an explicit supported/unsupported matrix.
-- Binary signing, notarization, Linux distribution format, update channel, and rollback retention policy need release-owner decisions after P1 artifact measurements.
+- Binary signing, notarization, Linux distribution format, update channel, and rollback retention policy are later P4/productization/release gates and need release-owner decisions after P1 artifact measurements.
 - The existing Node host can remain a rollback artifact only while its limitations are visible; it must not be advertised as equivalent to the Rust PTY/process-tree implementation.
 
 ## References
