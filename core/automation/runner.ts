@@ -14,7 +14,11 @@ import { DEFAULT_LOCALE, translate, type SupportedLocale } from '../i18n/backgro
 import { MCP_CAPABILITY_TOOL_PROVIDER_ID } from '../mcp/capability-contract';
 import { buildPromptAugmentation } from '../prompt';
 import { DEFAULT_TOOL_DESCRIPTORS } from '../tool';
-import { clampText, createToolExecutionRecord, runToolContinuationLoop } from '../tool-loop/engine';
+import { createToolExecutionRecord, runToolContinuationLoop } from '../tool-loop/engine';
+import {
+  DEFAULT_TOOL_RESULT_BUDGET,
+  projectToolResultForInjection,
+} from '../tool/result-budget';
 import type { ToolCall, ToolExecutionRecord, ToolResult } from '../types';
 import { NetworkPolicyError } from '../network/request-policy';
 import { createAutomationRunnerFailure } from './messages';
@@ -300,10 +304,7 @@ async function runAutomationToolLoop(
       ) {
         throw new AutomationToolOutcomeAmbiguousError(executionCall.name);
       }
-      return createToolExecutionRecord(executionCall, result, {
-        detailMaxLength: 4000,
-        outputMaxLength: 8000,
-      });
+      return createToolExecutionRecord(executionCall, result, DEFAULT_TOOL_RESULT_BUDGET);
     },
     buildContinuationPrompt: (executions) => buildAutomationToolContinuationPrompt(executions, locale),
     submitContinuation: (prompt, parentMessageId) => submitAutomationPrompt(
@@ -334,18 +335,23 @@ export function buildAutomationToolContinuationPrompt(
   executions: ToolExecutionRecord[],
   locale: SupportedLocale = DEFAULT_LOCALE,
 ): string {
-  const results = executions.map((execution) => ({
-    tool: execution.name,
-    provider: execution.provider?.displayName,
-    ok: execution.result.ok,
-    summary: execution.result.summary,
-    detail: clampText(execution.result.detail, 4000),
-    output: clampText(
-      execution.result.output === undefined ? undefined : JSON.stringify(execution.result.output),
-      8000,
-    ),
-    truncated: execution.result.truncated === true,
-  }));
+  const results = executions.map((execution) => {
+    const projected = projectToolResultForInjection({
+      detail: execution.result.detail,
+      output: execution.result.output === undefined ? undefined : JSON.stringify(execution.result.output),
+      truncated: execution.result.truncated,
+      truncation: execution.result.truncation,
+    });
+    return {
+      tool: execution.name,
+      provider: execution.provider?.displayName,
+      ok: execution.result.ok,
+      summary: execution.result.summary,
+      detail: projected.detail,
+      output: projected.output,
+      truncated: projected.truncated,
+    };
+  });
 
   return [
     translate(locale, 'prompt.automation.continuationIntro'),
