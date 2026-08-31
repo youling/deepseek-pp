@@ -79,7 +79,10 @@ describe('tool record compatibility contract', () => {
       name: CONTRACT_EXECUTION_RECORD.name,
       provider: CONTRACT_EXECUTION_RECORD.provider,
       descriptorId: CONTRACT_EXECUTION_RECORD.descriptorId,
-      result: CONTRACT_EXECUTION_RECORD.result,
+      result: {
+        ...CONTRACT_EXECUTION_RECORD.result,
+        truncation: { transport: false, fields: [], overflow: {} },
+      },
     });
   });
 

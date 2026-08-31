@@ -1,8 +1,12 @@
 import type { JsonValue, ToolCardResult, ToolExecutionRecord } from '../types';
-
-const DEFAULT_DETAIL_MAX_LENGTH = 4000;
-const DEFAULT_OUTPUT_MAX_LENGTH = 8000;
-const TRUNCATION_SUFFIX = '\n...[truncated]';
+import {
+  TOOL_RESULT_DEFAULT_DETAIL_MAX_LENGTH,
+  TOOL_RESULT_DEFAULT_OUTPUT_MAX_LENGTH,
+  buildToolResultTruncation,
+  clampToolResultText,
+  projectToolResultField,
+  resolveToolResultTransportTruncated,
+} from './result-budget';
 
 export interface ToolExecutionRestoreLimits {
   detailMaxLength?: number;
@@ -41,21 +45,41 @@ function sanitizeToolCardResultForRestoreStorage(
   result: ToolCardResult,
   limits: ToolExecutionRestoreLimits,
 ): ToolCardResult {
-  const detailMaxLength = limits.detailMaxLength ?? DEFAULT_DETAIL_MAX_LENGTH;
-  const outputMaxLength = limits.outputMaxLength ?? DEFAULT_OUTPUT_MAX_LENGTH;
+  const detailMaxLength = limits.detailMaxLength ?? TOOL_RESULT_DEFAULT_DETAIL_MAX_LENGTH;
+  const outputMaxLength = limits.outputMaxLength ?? TOOL_RESULT_DEFAULT_OUTPUT_MAX_LENGTH;
+
+  const detailProjection = projectToolResultField(result.detail, detailMaxLength);
+  const outputProjection = projectToolResultForStorage(result.output, outputMaxLength);
+
+  const { truncated, truncation } = buildToolResultTruncation({
+    transport: resolveToolResultTransportTruncated(result.truncated, result.truncation),
+    detail: detailProjection,
+    output: outputProjection?.projection,
+  });
+
   return {
     ...result,
-    detail: clampText(result.detail, detailMaxLength),
-    output: sanitizeOutputForStorage(result.output, outputMaxLength),
+    detail: clampToolResultText(result.detail, detailMaxLength),
+    output: outputProjection?.value,
+    truncated,
+    truncation,
   };
 }
 
-function sanitizeOutputForStorage(output: JsonValue | undefined, maxLength: number): JsonValue | undefined {
+function projectToolResultForStorage(
+  output: JsonValue | undefined,
+  maxLength: number,
+): { value: JsonValue | undefined; projection: { cut: boolean; originalChars: number; projectedChars: number } | undefined } | undefined {
   if (output === undefined) return undefined;
 
   const serialized = safeStringify(output);
-  if (serialized.length <= maxLength) return output;
-  return clampText(serialized, maxLength);
+  if (serialized.length <= maxLength) {
+    return { value: output, projection: { cut: false, originalChars: serialized.length, projectedChars: serialized.length } };
+  }
+  return {
+    value: clampToolResultText(serialized, maxLength),
+    projection: { cut: true, originalChars: serialized.length, projectedChars: maxLength },
+  };
 }
 
 function normalizeRestoredOutput(output: JsonValue | undefined): JsonValue | undefined {
@@ -84,9 +108,4 @@ function safeStringify(value: JsonValue): string {
   } catch {
     return String(value);
   }
-}
-
-function clampText(value: string | undefined, maxLength: number): string | undefined {
-  if (!value) return value;
-  return value.length > maxLength ? `${value.slice(0, maxLength)}${TRUNCATION_SUFFIX}` : value;
 }

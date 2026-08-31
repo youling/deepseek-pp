@@ -36,6 +36,8 @@ import type {
   ToolPayload,
   ToolProviderIdentity,
   ToolResult as GenericToolResult,
+  ToolResultField,
+  ToolResultTruncationProvenance,
 } from './tool/types';
 import type {
   UsageRangeDays as UsageRangeDaysType,
@@ -96,6 +98,8 @@ export type {
   ToolProviderKind,
   ToolRegistrySnapshot,
   ToolResult,
+  ToolResultField,
+  ToolResultTruncationProvenance,
   ToolRiskLevel,
   RuntimeToolAuthorizationContext,
   ToolGrantExecutionContext,
@@ -499,7 +503,14 @@ export interface ToolCall extends GenericToolCall {}
 export interface ToolCardResult extends Pick<
   GenericToolResult,
   'ok' | 'summary' | 'detail' | 'output' | 'truncated' | 'error' | 'descriptorId' | 'provider' | 'name'
-> {}
+> {
+  /**
+   * Typed provenance distinguishing transport-origin truncation from local
+   * context-injection truncation. Absent for legacy records (where the only
+   * prior source of `truncated:true` was transport/provider truncation).
+   */
+  truncation?: ToolResultTruncationProvenance;
+}
 
 export interface ToolExecutionRecord {
   callId?: string;
