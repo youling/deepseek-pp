@@ -52,6 +52,11 @@ import {
   executeMcpCapabilityToolCall,
 } from '../../core/mcp/capability-tools';
 import {
+  createLocalRuntimeToolDescriptors,
+  executeLocalRuntimeToolCall,
+  LOCAL_RUNTIME_TOOL_PROVIDER,
+} from '../../core/local-runtime';
+import {
   ToolProviderRegistry,
   type RuntimeToolProvider,
   type ToolProviderDescriptorContext,
@@ -118,6 +123,11 @@ export function createProductionToolProviderRegistry(): ToolProviderRegistry {
         return createBrowserControlToolDescriptors(locale);
       },
       (call, _descriptor, { locale }) => executeBrowserControlToolCall(call, locale),
+    ),
+    createLocalProvider(
+      LOCAL_RUNTIME_TOOL_PROVIDER.id,
+      ({ locale }) => createLocalRuntimeToolDescriptors(locale),
+      (call, descriptor) => executeLocalRuntimeToolCall(call, descriptor),
     ),
     createMcpCapabilityProvider(),
     createMcpProvider(),

@@ -1,0 +1,43 @@
+[package]
+name = "deepseek-pp-local-runtime"
+version = "1.0.0"
+edition = "2021"
+description = "DeepSeek++ Local Coding Runtime native host (canary)"
+license = "Apache-2.0"
+rust-version = "1.74"
+
+[[bin]]
+name = "deepseek-pp-local-runtime"
+path = "src/main.rs"
+
+[lib]
+name = "deepseek_pp_local_runtime"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+portable-pty = "0.9"
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = [
+  "winnt",
+  "winbase",
+  "handleapi",
+  "processthreadsapi",
+  "jobapi2",
+  "synchapi",
+  "psapi",
+  "errhandlingapi",
+  "minwindef",
+] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = "z"
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
