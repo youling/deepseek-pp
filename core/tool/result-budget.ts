@@ -91,11 +91,12 @@ export function projectToolResultField(
   // field length; otherwise the incoming string is the source.
   const originalChars = prev ? prev.originalChars : value.length;
   const cut = originalChars > maxLength;
-  return {
-    cut,
-    originalChars,
-    projectedChars: cut ? maxLength : originalChars,
-  };
+  // prev.projectedChars is the true retained ceiling from the earlier
+  // projection; a wider budget cannot fabricate data that was already lost.
+  const projectedChars = cut
+    ? (prev ? Math.min(prev.projectedChars, maxLength) : maxLength)
+    : originalChars;
+  return { cut, originalChars, projectedChars };
 }
 
 /**

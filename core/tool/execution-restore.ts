@@ -2,6 +2,7 @@ import { type JsonValue, type ToolCardResult, type ToolExecutionRecord } from '.
 import {
   TOOL_RESULT_DEFAULT_DETAIL_MAX_LENGTH,
   TOOL_RESULT_DEFAULT_OUTPUT_MAX_LENGTH,
+  TOOL_RESULT_TRUNCATION_SUFFIX,
   buildToolResultTruncation,
   clampToolResultText,
   projectToolResultField,
@@ -82,19 +83,40 @@ function projectToolResultForStorage(
 ): { value: JsonValue | undefined; projection: ToolFieldProjection | undefined } | undefined {
   if (output === undefined) return undefined;
 
+  // When the incoming output is already a clamped string (from a prior
+  // sanitize), re-safeStringify would double-encode it (adding JSON quotes
+  // around the suffix) and drift the retained text. Detect this and operate
+  // directly on the string length.
+  const alreadyClamped =
+    typeof output === 'string' &&
+    output.endsWith(TOOL_RESULT_TRUNCATION_SUFFIX) &&
+    prev !== undefined;
+
+  if (alreadyClamped) {
+    // output is the raw retained string from a prior clamp (no safeStringify).
+    // The true original length is authoritative from prev.
+    const originalChars = prev.originalChars;
+    const cut = originalChars > maxLength;
+    // retained ceiling: never expand past what was already retained.
+    const projectedChars = cut
+      ? Math.min(prev.projectedChars, maxLength)
+      : originalChars;
+    return {
+      value: cut ? clampToolResultText(output, maxLength) : output,
+      projection: { cut, originalChars, projectedChars },
+    };
+  }
+
+  // Normal path: serialize the structured JsonValue, then compose.
   const serialized = safeStringify(output);
-  // Composition rule: a previously recorded overflow is authoritative for the
-  // true original length, so re-projecting an already-bounded storage field
-  // never downgrades known provenance.
   const originalChars = prev ? prev.originalChars : serialized.length;
   const cut = originalChars > maxLength;
+  const projectedChars = cut
+    ? (prev ? Math.min(prev.projectedChars, maxLength) : maxLength)
+    : originalChars;
   return {
     value: cut ? clampToolResultText(serialized, maxLength) : output,
-    projection: {
-      cut,
-      originalChars,
-      projectedChars: cut ? maxLength : originalChars,
-    },
+    projection: { cut, originalChars, projectedChars },
   };
 }
 
