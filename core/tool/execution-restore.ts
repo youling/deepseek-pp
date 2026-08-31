@@ -1,4 +1,4 @@
-import type { JsonValue, ToolCardResult, ToolExecutionRecord } from '../types';
+import { type JsonValue, type ToolCardResult, type ToolExecutionRecord } from '../types';
 import {
   TOOL_RESULT_DEFAULT_DETAIL_MAX_LENGTH,
   TOOL_RESULT_DEFAULT_OUTPUT_MAX_LENGTH,
@@ -6,6 +6,7 @@ import {
   clampToolResultText,
   projectToolResultField,
   resolveToolResultTransportTruncated,
+  type ToolFieldProjection,
 } from './result-budget';
 
 export interface ToolExecutionRestoreLimits {
@@ -48,8 +49,16 @@ function sanitizeToolCardResultForRestoreStorage(
   const detailMaxLength = limits.detailMaxLength ?? TOOL_RESULT_DEFAULT_DETAIL_MAX_LENGTH;
   const outputMaxLength = limits.outputMaxLength ?? TOOL_RESULT_DEFAULT_OUTPUT_MAX_LENGTH;
 
-  const detailProjection = projectToolResultField(result.detail, detailMaxLength);
-  const outputProjection = projectToolResultForStorage(result.output, outputMaxLength);
+  const detailProjection = projectToolResultField(
+    result.detail,
+    detailMaxLength,
+    result.truncation?.overflow.detail,
+  );
+  const outputProjection = projectToolResultForStorage(
+    result.output,
+    outputMaxLength,
+    result.truncation?.overflow.output,
+  );
 
   const { truncated, truncation } = buildToolResultTruncation({
     transport: resolveToolResultTransportTruncated(result.truncated, result.truncation),
@@ -69,16 +78,23 @@ function sanitizeToolCardResultForRestoreStorage(
 function projectToolResultForStorage(
   output: JsonValue | undefined,
   maxLength: number,
-): { value: JsonValue | undefined; projection: { cut: boolean; originalChars: number; projectedChars: number } | undefined } | undefined {
+  prev?: { originalChars: number; projectedChars: number },
+): { value: JsonValue | undefined; projection: ToolFieldProjection | undefined } | undefined {
   if (output === undefined) return undefined;
 
   const serialized = safeStringify(output);
-  if (serialized.length <= maxLength) {
-    return { value: output, projection: { cut: false, originalChars: serialized.length, projectedChars: serialized.length } };
-  }
+  // Composition rule: a previously recorded overflow is authoritative for the
+  // true original length, so re-projecting an already-bounded storage field
+  // never downgrades known provenance.
+  const originalChars = prev ? prev.originalChars : serialized.length;
+  const cut = originalChars > maxLength;
   return {
-    value: clampToolResultText(serialized, maxLength),
-    projection: { cut: true, originalChars: serialized.length, projectedChars: maxLength },
+    value: cut ? clampToolResultText(serialized, maxLength) : output,
+    projection: {
+      cut,
+      originalChars,
+      projectedChars: cut ? maxLength : originalChars,
+    },
   };
 }
 

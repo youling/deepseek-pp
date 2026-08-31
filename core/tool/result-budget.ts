@@ -3,6 +3,8 @@ import type {
   ToolResultTruncationProvenance,
 } from '../types';
 
+export type { ToolResultField, ToolResultTruncationProvenance };
+
 /**
  * Authoritative tool-result injection/budget policy.
  *
@@ -70,16 +72,30 @@ export interface ToolFieldProjection {
  * under `maxLength` (matching `clampToolResultText`'s cut condition) and, if
  * so, capture the deterministic overflow counts. `undefined` input means no
  * cut.
+ *
+ * `prev` is the projection already recorded for this field by an earlier
+ * bounded projection (i.e. `truncation.overflow[field]`). When present it is
+ * authoritative for the true original source length, so a repeated projection
+ * of an already-bounded string never loses the original overflow counts, and
+ * a stricter later projection composes provenance instead of replacing it:
+ * `originalChars` stays the true source length while `projectedChars` is
+ * tightened to the stricter bound.
  */
 export function projectToolResultField(
   value: string | undefined,
   maxLength: number,
+  prev?: { originalChars: number; projectedChars: number },
 ): ToolFieldProjection | undefined {
-  if (!value) return undefined;
-  if (value.length <= maxLength) {
-    return { cut: false, originalChars: value.length, projectedChars: value.length };
-  }
-  return { cut: true, originalChars: value.length, projectedChars: maxLength };
+  if (value === undefined) return undefined;
+  // The recorded prior overflow is the source of truth for the original
+  // field length; otherwise the incoming string is the source.
+  const originalChars = prev ? prev.originalChars : value.length;
+  const cut = originalChars > maxLength;
+  return {
+    cut,
+    originalChars,
+    projectedChars: cut ? maxLength : originalChars,
+  };
 }
 
 /**
@@ -163,9 +179,18 @@ export function projectToolResultForInjection(
 ): ProjectToolResultInjectionOutput {
   const budget = resolveToolResultBudget(limits);
   const transport = resolveToolResultTransportTruncated(input.truncated, input.truncation);
+  const prev = input.truncation;
 
-  const detailProjection = projectToolResultField(input.detail, budget.detailMaxLength);
-  const outputProjection = projectToolResultField(input.output, budget.outputMaxLength);
+  const detailProjection = projectToolResultField(
+    input.detail,
+    budget.detailMaxLength,
+    prev?.overflow.detail,
+  );
+  const outputProjection = projectToolResultField(
+    input.output,
+    budget.outputMaxLength,
+    prev?.overflow.output,
+  );
 
   const { truncated, truncation } = buildToolResultTruncation({
     transport,

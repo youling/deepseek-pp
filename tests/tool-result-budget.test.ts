@@ -4,10 +4,12 @@ import {
   TOOL_RESULT_DEFAULT_DETAIL_MAX_LENGTH,
   TOOL_RESULT_DEFAULT_OUTPUT_MAX_LENGTH,
   TOOL_RESULT_TRUNCATION_SUFFIX,
-  clampToolResultText,
   projectToolResultForInjection,
   type ToolResultBudget,
+  type ToolResultTruncationProvenance,
 } from '../core/tool/result-budget';
+import { sanitizeToolExecutionForRestoreStorage } from '../core/tool/execution-restore';
+import type { ToolExecutionRecord } from '../core/types';
 
 const NARROW_BUDGET: ToolResultBudget = {
   detailMaxLength: 100,
@@ -123,27 +125,151 @@ describe('tool-result injection budget and truncation provenance', () => {
     expect(injection.truncation.fields).toEqual(['detail', 'output']);
   });
 
-  it('keeps transport provenance when re-projecting an already-bounded record (idempotent)', () => {
+  it('same-budget re-projection preserves overflow provenance exactly (idempotent)', () => {
     const first = projectToolResultForInjection({
       detail: 'd'.repeat(TOOL_RESULT_DEFAULT_DETAIL_MAX_LENGTH + 10),
       output: 'o'.repeat(TOOL_RESULT_DEFAULT_OUTPUT_MAX_LENGTH + 10),
       truncated: false,
       truncation: undefined,
     });
+
+    // First projection records the true original lengths.
+    const expectedDetail: ToolResultTruncationProvenance['overflow']['detail'] = {
+      originalChars: TOOL_RESULT_DEFAULT_DETAIL_MAX_LENGTH + 10,
+      projectedChars: TOOL_RESULT_DEFAULT_DETAIL_MAX_LENGTH,
+    };
+    const expectedOutput: ToolResultTruncationProvenance['overflow']['output'] = {
+      originalChars: TOOL_RESULT_DEFAULT_OUTPUT_MAX_LENGTH + 10,
+      projectedChars: TOOL_RESULT_DEFAULT_OUTPUT_MAX_LENGTH,
+    };
+    expect(first.truncation.overflow.detail).toEqual(expectedDetail);
+    expect(first.truncation.overflow.output).toEqual(expectedOutput);
+
+    // Re-project the already-bounded strings at the SAME budget. The
+    // provenance must survive byte-for-byte: originalChars is the true source
+    // length, never the length of the bounded string + suffix.
     const second = projectToolResultForInjection({
       detail: first.detail,
       output: first.output,
       truncated: first.truncated,
       truncation: first.truncation,
     });
-    // transport stays false (the source never truncated); local cut remains.
+
     expect(second.truncated).toBe(true);
     expect(second.truncation.transport).toBe(false);
-    expect(second.truncation.fields).toContain('output');
-    // The clamp primitive is idempotent on text length.
-    expect(second.output).toBeDefined();
-    expect(clampToolResultText(second.output, TOOL_RESULT_DEFAULT_OUTPUT_MAX_LENGTH)!.length)
-      .toBeLessThanOrEqual(TOOL_RESULT_DEFAULT_OUTPUT_MAX_LENGTH + TOOL_RESULT_TRUNCATION_SUFFIX.length);
+    expect(second.truncation.fields).toEqual(['detail', 'output']);
+    expect(second.truncation.overflow.detail).toEqual(expectedDetail);
+    expect(second.truncation.overflow.output).toEqual(expectedOutput);
+    // Text is unchanged (idempotent clamp, no double suffix).
+    expect(second.detail).toBe(first.detail);
+    expect(second.output).toBe(first.output);
+    expect(second.detail!.length)
+      .toBeLessThanOrEqual(TOOL_RESULT_DEFAULT_DETAIL_MAX_LENGTH + TOOL_RESULT_TRUNCATION_SUFFIX.length);
+    // The provenance must NOT derive from the bounded string: the true source
+    // (4010) exceeds the budget (4000), while the bounded string + suffix
+    // (4015) is what the defect would have wrongly recorded as originalChars.
+    expect(second.truncation.overflow.detail!.originalChars)
+      .toBe(TOOL_RESULT_DEFAULT_DETAIL_MAX_LENGTH + 10);
+    expect(second.truncation.overflow.detail!.originalChars)
+      .toBeGreaterThan(TOOL_RESULT_DEFAULT_DETAIL_MAX_LENGTH);
+  });
+
+  it('stricter later budget composes provenance: original length kept, projected tightened', () => {
+    const first = projectToolResultForInjection({
+      detail: 'd'.repeat(TOOL_RESULT_DEFAULT_DETAIL_MAX_LENGTH + 10),
+      output: 'o'.repeat(TOOL_RESULT_DEFAULT_OUTPUT_MAX_LENGTH + 10),
+      truncated: false,
+      truncation: undefined,
+    });
+
+    // Re-project the already-bounded record under a stricter budget.
+    const stricter = projectToolResultForInjection({
+      detail: first.detail,
+      output: first.output,
+      truncated: first.truncated,
+      truncation: first.truncation,
+    }, {
+      detailMaxLength: NARROW_BUDGET.detailMaxLength!,
+      outputMaxLength: NARROW_BUDGET.outputMaxLength!,
+    });
+
+    // original source length is preserved from the first projection.
+    expect(stricter.truncation.overflow.detail!.originalChars)
+      .toBe(TOOL_RESULT_DEFAULT_DETAIL_MAX_LENGTH + 10);
+    expect(stricter.truncation.overflow.output!.originalChars)
+      .toBe(TOOL_RESULT_DEFAULT_OUTPUT_MAX_LENGTH + 10);
+    // retained/projected length reflects the stricter bound.
+    expect(stricter.truncation.overflow.detail!.projectedChars).toBe(NARROW_BUDGET.detailMaxLength);
+    expect(stricter.truncation.overflow.output!.projectedChars).toBe(NARROW_BUDGET.outputMaxLength);
+    // text is tightened accordingly.
+    expect(stricter.detail).toBe(
+      first.detail!.slice(0, NARROW_BUDGET.detailMaxLength!) + TOOL_RESULT_TRUNCATION_SUFFIX,
+    );
+    expect(stricter.truncated).toBe(true);
+  });
+
+  it('composes transport-origin and local truncation together without losing either', () => {
+    // Incoming record: provider flagged transport truncation AND detail is large
+    // enough that injection must also bound it locally.
+    const first = projectToolResultForInjection({
+      detail: 'd'.repeat(TOOL_RESULT_DEFAULT_DETAIL_MAX_LENGTH + 10),
+      output: 'small',
+      truncated: true, // transport-origin truncation
+      truncation: undefined,
+    });
+    expect(first.truncation.transport).toBe(true);
+    expect(first.truncation.fields).toEqual(['detail']);
+
+    // Re-project at the same budget: both transport provenance and the local
+    // overflow must remain.
+    const second = projectToolResultForInjection({
+      detail: first.detail,
+      output: first.output,
+      truncated: first.truncated,
+      truncation: first.truncation,
+    });
+    expect(second.truncation.transport).toBe(true);
+    expect(second.truncated).toBe(true);
+    expect(second.truncation.fields).toEqual(['detail']);
+    expect(second.truncation.overflow.detail).toEqual({
+      originalChars: TOOL_RESULT_DEFAULT_DETAIL_MAX_LENGTH + 10,
+      projectedChars: TOOL_RESULT_DEFAULT_DETAIL_MAX_LENGTH,
+    });
+  });
+
+  it('restore/storage projection does not downgrade existing provenance (round trip)', () => {
+    const detailSource = 'd'.repeat(TOOL_RESULT_DEFAULT_DETAIL_MAX_LENGTH + 10);
+    const outputSource = 'o'.repeat(TOOL_RESULT_DEFAULT_OUTPUT_MAX_LENGTH + 10);
+    // The storage path serializes the output field (JSON-quoting a string), so
+    // the true serialized source length differs from the raw string length.
+    const outputSerializedLength = JSON.stringify(outputSource).length;
+
+    const execution: ToolExecutionRecord = {
+      name: 'artifact_create',
+      result: {
+        ok: true,
+        summary: 'Read file',
+        detail: detailSource,
+        output: outputSource,
+        truncated: false,
+      },
+    };
+
+    // First storage sanitization bounds and records provenance.
+    const stored1 = sanitizeToolExecutionForRestoreStorage(execution);
+    expect(stored1.result.truncated).toBe(true);
+    expect(stored1.result.truncation!.overflow.detail!.originalChars).toBe(detailSource.length);
+    expect(stored1.result.truncation!.overflow.output!.originalChars).toBe(outputSerializedLength);
+
+    // Re-sanitizing the already-sanitized (bounded) record must preserve the
+    // original overflow counts exactly — never downgrade to the bounded length.
+    const stored2 = sanitizeToolExecutionForRestoreStorage(stored1);
+    expect(stored2.result.truncated).toBe(true);
+    expect(stored2.result.truncation).toEqual(stored1.result.truncation);
+    expect(stored2.result.truncation!.overflow.detail!.originalChars).toBe(detailSource.length);
+    expect(stored2.result.truncation!.overflow.output!.originalChars).toBe(outputSerializedLength);
+    expect(stored2.result.truncation!.overflow.output!.projectedChars)
+      .toBe(TOOL_RESULT_DEFAULT_OUTPUT_MAX_LENGTH);
   });
 
   it('only bounds the field that exceeds its budget', () => {
