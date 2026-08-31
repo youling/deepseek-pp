@@ -1,0 +1,56 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://deepseek-pp.local/schema/deepseek-pp-local-runtime.schema.json",
+  "title": "deepseek-pp-local-runtime v1",
+  "description": "Language-neutral contract for the DeepSeek++ Local Coding Runtime native host (com.deepseek_pp.runtime.canary). Executes host-owned, grant-bound canary profiles only.",
+  "type": "object",
+  "required": ["protocol", "version", "request_id", "operation"],
+  "additionalProperties": false,
+  "properties": {
+    "protocol": {
+      "const": "deepseek-pp-local-runtime"
+    },
+    "version": {
+      "const": 1
+    },
+    "request_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "operation": {
+      "enum": ["runtime_status", "runtime_exec"]
+    },
+    "grant_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "workspace_id": {
+      "type": "string",
+      "maxLength": 256
+    },
+    "profile_id": {
+      "type": "string",
+      "enum": ["canary.echo", "canary.spawn_sleeper"]
+    },
+    "timeout_ms": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 3600000
+    },
+    "max_output_bytes": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1000000
+    },
+    "args": {
+      "type": "array",
+      "maxItems": 8,
+      "items": {
+        "type": "string",
+        "maxLength": 1024
+      }
+    }
+  }
+}

@@ -47,3 +47,70 @@ jobs:
 
       - name: Run quality gates
         run: npm run ci:quality
+
+  local-runtime-linux:
+    name: Local Runtime (Rust, Linux PTY)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            runtime/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('runtime/Cargo.lock', 'runtime/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Run Rust tests (unit + integration)
+        working-directory: runtime
+        run: cargo test --all-targets
+
+      - name: Run gated PTY execution tests (POSIX)
+        working-directory: runtime
+        run: cargo test --all-targets -- --ignored
+
+  local-runtime-windows-msvc:
+    name: Local Runtime (Rust, Windows MSVC)
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust (MSVC)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            runtime/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('runtime/Cargo.lock', 'runtime/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Build release MSVC artifact (ADR-001 target evidence)
+        working-directory: runtime
+        run: cargo build --release
+
+      - name: Run Rust tests (unit + integration)
+        working-directory: runtime
+        run: cargo test --all-targets
+
+      - name: Run gated PTY + Job Object teardown tests (native MSVC ConPTY)
+        working-directory: runtime
+        run: cargo test --all-targets -- --ignored
+
