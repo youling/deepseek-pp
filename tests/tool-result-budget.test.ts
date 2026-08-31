@@ -376,20 +376,29 @@ describe('tool-result injection budget and truncation provenance', () => {
       result: { ok: true, summary: 'Fetched', detail: 'detail', output: outputSource, truncated: false },
     };
 
-    // First sanitize: output clamped, provenance recorded.
+    // First sanitize: output clamped to default budget 8000, provenance recorded.
     const stored1 = sanitizeToolExecutionForRestoreStorage(execution);
     expect(stored1.result.truncated).toBe(true);
+    const originalChars = stored1.result.truncation!.overflow.output!.originalChars;
 
-    // Second sanitize with a wider budget that exceeds originalChars.
-    const stored2 = sanitizeToolExecutionForRestoreStorage({
-      ...stored1,
-      // Override limits to be wider than original — the clamped text must not
-      // be re-stringified or treated as a complete value.
-    } as ToolExecutionRecord);
+    // Second sanitize with outputMaxLength > originalChars — truly wider than
+    // the source length so the already-clamped text must NOT be treated as
+    // complete or re-stringified.
+    const widerBudget = { outputMaxLength: originalChars + 100 };
+    const stored2 = sanitizeToolExecutionForRestoreStorage(
+      stored1 as unknown as ToolExecutionRecord,
+      widerBudget,
+    );
 
-    // text and provenance byte-identical.
+    // truncated stays true — lost data cannot be restored.
+    expect(stored2.result.truncated).toBe(true);
+    // output text byte-identical — no double-stringify, no suffix change.
     expect(stored2.result.output).toBe(stored1.result.output);
+    // provenance byte-identical — originalChars unchanged, projectedChars capped.
     expect(stored2.result.truncation).toEqual(stored1.result.truncation);
+    expect(stored2.result.truncation!.overflow.output!.originalChars).toBe(originalChars);
+    expect(stored2.result.truncation!.overflow.output!.projectedChars)
+      .toBe(TOOL_RESULT_DEFAULT_OUTPUT_MAX_LENGTH);
     // output is still a clamped string, not a restored complete value.
     expect(typeof stored2.result.output).toBe('string');
     expect((stored2.result.output as string).endsWith(TOOL_RESULT_TRUNCATION_SUFFIX)).toBe(true);
