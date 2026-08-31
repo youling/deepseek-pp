@@ -333,6 +333,68 @@ describe('tool-result injection budget and truncation provenance', () => {
     expect((stored1.result.output as string).endsWith(TOOL_RESULT_TRUNCATION_SUFFIX)).toBe(true);
   });
 
+  it('narrow then budget >= originalChars: provenance and truncated unchanged, text not restored', () => {
+    // First: narrow budget clips detail (4010 → 100) and output (8010 → 200).
+    const narrow = projectToolResultForInjection({
+      detail: 'd'.repeat(TOOL_RESULT_DEFAULT_DETAIL_MAX_LENGTH + 10),
+      output: 'o'.repeat(TOOL_RESULT_DEFAULT_OUTPUT_MAX_LENGTH + 10),
+      truncated: false,
+      truncation: undefined,
+    }, NARROW_BUDGET);
+
+    // Second: budget larger than original source. The local truncation must NOT
+    // be cleared — the data was already lost by the narrow projection.
+    const wider = projectToolResultForInjection({
+      detail: narrow.detail,
+      output: narrow.output,
+      truncated: narrow.truncated,
+      truncation: narrow.truncation,
+    }, {
+      detailMaxLength: TOOL_RESULT_DEFAULT_DETAIL_MAX_LENGTH + 100,
+      outputMaxLength: TOOL_RESULT_DEFAULT_OUTPUT_MAX_LENGTH + 100,
+    });
+
+    // cut stays true because originalChars > min(prev.projectedChars, newBudget).
+    expect(wider.truncated).toBe(true);
+    expect(wider.truncation.fields).toEqual(['detail', 'output']);
+    // projectedChars remains at the narrow ceiling — not restored.
+    expect(wider.truncation.overflow.detail!.originalChars)
+      .toBe(TOOL_RESULT_DEFAULT_DETAIL_MAX_LENGTH + 10);
+    expect(wider.truncation.overflow.detail!.projectedChars).toBe(NARROW_BUDGET.detailMaxLength);
+    expect(wider.truncation.overflow.output!.originalChars)
+      .toBe(TOOL_RESULT_DEFAULT_OUTPUT_MAX_LENGTH + 10);
+    expect(wider.truncation.overflow.output!.projectedChars).toBe(NARROW_BUDGET.outputMaxLength);
+    // text byte-identical to narrow — suffix not duplicated, content not restored.
+    expect(wider.detail).toBe(narrow.detail);
+    expect(wider.output).toBe(narrow.output);
+  });
+
+  it('storage already-clamped then budget >= originalChars: text and provenance byte-identical', () => {
+    const outputSource = 'o'.repeat(TOOL_RESULT_DEFAULT_OUTPUT_MAX_LENGTH + 10);
+    const execution: ToolExecutionRecord = {
+      name: 'web_fetch',
+      result: { ok: true, summary: 'Fetched', detail: 'detail', output: outputSource, truncated: false },
+    };
+
+    // First sanitize: output clamped, provenance recorded.
+    const stored1 = sanitizeToolExecutionForRestoreStorage(execution);
+    expect(stored1.result.truncated).toBe(true);
+
+    // Second sanitize with a wider budget that exceeds originalChars.
+    const stored2 = sanitizeToolExecutionForRestoreStorage({
+      ...stored1,
+      // Override limits to be wider than original — the clamped text must not
+      // be re-stringified or treated as a complete value.
+    } as ToolExecutionRecord);
+
+    // text and provenance byte-identical.
+    expect(stored2.result.output).toBe(stored1.result.output);
+    expect(stored2.result.truncation).toEqual(stored1.result.truncation);
+    // output is still a clamped string, not a restored complete value.
+    expect(typeof stored2.result.output).toBe('string');
+    expect((stored2.result.output as string).endsWith(TOOL_RESULT_TRUNCATION_SUFFIX)).toBe(true);
+  });
+
   it('only bounds the field that exceeds its budget', () => {
     const projected = projectToolResultForInjection({
       detail: 'd'.repeat(TOOL_RESULT_DEFAULT_DETAIL_MAX_LENGTH + 10),

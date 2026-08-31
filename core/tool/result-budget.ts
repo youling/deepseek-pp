@@ -87,16 +87,20 @@ export function projectToolResultField(
   prev?: { originalChars: number; projectedChars: number },
 ): ToolFieldProjection | undefined {
   if (value === undefined) return undefined;
-  // The recorded prior overflow is the source of truth for the original
-  // field length; otherwise the incoming string is the source.
+  // When prev exists, the retained ceiling from the earlier projection is
+  // authoritative; a wider budget cannot fabricate data that was already
+  // lost. Compute the effective ceiling first, then derive cut from it.
   const originalChars = prev ? prev.originalChars : value.length;
+  if (prev) {
+    const effectiveProjectedChars = Math.min(prev.projectedChars, maxLength);
+    return {
+      cut: originalChars > effectiveProjectedChars,
+      originalChars,
+      projectedChars: effectiveProjectedChars,
+    };
+  }
   const cut = originalChars > maxLength;
-  // prev.projectedChars is the true retained ceiling from the earlier
-  // projection; a wider budget cannot fabricate data that was already lost.
-  const projectedChars = cut
-    ? (prev ? Math.min(prev.projectedChars, maxLength) : maxLength)
-    : originalChars;
-  return { cut, originalChars, projectedChars };
+  return { cut, originalChars, projectedChars: cut ? maxLength : originalChars };
 }
 
 /**

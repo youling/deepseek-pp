@@ -96,27 +96,30 @@ function projectToolResultForStorage(
     // output is the raw retained string from a prior clamp (no safeStringify).
     // The true original length is authoritative from prev.
     const originalChars = prev.originalChars;
-    const cut = originalChars > maxLength;
-    // retained ceiling: never expand past what was already retained.
-    const projectedChars = cut
-      ? Math.min(prev.projectedChars, maxLength)
-      : originalChars;
+    const effectiveProjectedChars = Math.min(prev.projectedChars, maxLength);
+    const cut = originalChars > effectiveProjectedChars;
     return {
       value: cut ? clampToolResultText(output, maxLength) : output,
-      projection: { cut, originalChars, projectedChars },
+      projection: { cut, originalChars, projectedChars: effectiveProjectedChars },
     };
   }
 
   // Normal path: serialize the structured JsonValue, then compose.
   const serialized = safeStringify(output);
-  const originalChars = prev ? prev.originalChars : serialized.length;
+  if (prev) {
+    const originalChars = prev.originalChars;
+    const effectiveProjectedChars = Math.min(prev.projectedChars, maxLength);
+    const cut = originalChars > effectiveProjectedChars;
+    return {
+      value: cut ? clampToolResultText(serialized, maxLength) : output,
+      projection: { cut, originalChars, projectedChars: effectiveProjectedChars },
+    };
+  }
+  const originalChars = serialized.length;
   const cut = originalChars > maxLength;
-  const projectedChars = cut
-    ? (prev ? Math.min(prev.projectedChars, maxLength) : maxLength)
-    : originalChars;
   return {
     value: cut ? clampToolResultText(serialized, maxLength) : output,
-    projection: { cut, originalChars, projectedChars },
+    projection: { cut, originalChars, projectedChars: cut ? maxLength : originalChars },
   };
 }
 
