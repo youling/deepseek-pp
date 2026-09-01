@@ -1,0 +1,60 @@
+name: Interim GitHub MCP Build
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Chrome interim package
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Validate MCP and P0 contracts
+        run: |
+          npm run prompt:freeze
+          npm run compile
+          npx vitest run tests/tool-result-budget.test.ts tests/tool-record-contract.test.ts
+          npm run smoke:mcp
+          npm run verify:mcp:mock
+
+      - name: Build Chrome package
+        run: |
+          npm run build:chrome
+          npm run zip:chrome
+
+      - name: Record SHA256
+        shell: bash
+        run: |
+          ZIP="dist/deepseek-plus-plus-$(node -p "require('./package.json').version")-chrome.zip"
+          test -f "$ZIP"
+          sha256sum "$ZIP" > "$ZIP.sha256"
+          cat "$ZIP.sha256"
+
+      - name: Upload Chrome package
+        uses: actions/upload-artifact@v4
+        with:
+          name: deepseek-pp-gh-mcp-interim-${{ github.sha }}
+          path: |
+            dist/deepseek-plus-plus-*-chrome.zip
+            dist/deepseek-plus-plus-*-chrome.zip.sha256
+          if-no-files-found: error
+          retention-days: 14
