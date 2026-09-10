@@ -138,6 +138,32 @@ export interface ToolResult {
   truncated?: boolean;
 }
 
+/**
+ * A result field that can be locally bounded by the extension for context
+ * injection (as opposed to truncation performed by the provider/transport).
+ */
+export type ToolResultField = 'detail' | 'output';
+
+/**
+ * Typed, serializable provenance for tool-result truncation. Distinguishes
+ * transport-origin truncation (the incoming result was already flagged
+ * truncated by the provider/transport) from extension/context-injection
+ * truncation (a local, bounded projection applied for model context), instead
+ * of collapsing every cause into an ambiguous boolean.
+ *
+ * `overflow` records, per locally bounded field, the deterministic char counts
+ * that were projected away from the original — enough metadata for a later
+ * continuation/paging layer to request the remainder without re-deriving it.
+ */
+export interface ToolResultTruncationProvenance {
+  /** True when the incoming result was truncated by the provider/transport. */
+  transport: boolean;
+  /** Fields this projection locally bounded for context injection. Empty when none. */
+  fields: ToolResultField[];
+  /** Deterministic overflow per locally bounded field. */
+  overflow: Partial<Record<ToolResultField, { originalChars: number; projectedChars: number }>>;
+}
+
 export interface ToolExecutionContext {
   trigger: ToolExecutionTrigger;
   requestId: string;
