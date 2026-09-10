@@ -7,17 +7,8 @@ use std::process::ExitCode;
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(|s| s.as_str()) {
-        Some("--echo-canary") => {
-            return ExitCode::from(deepseek_pp_local_runtime::host::canary_main(&args[2..]) as u8);
-        }
-        Some("--exit-code") => {
+        Some("--echo-canary") | Some("--exit-code") | Some("--emit-burst") | Some("--spawn-sleeper") => {
             return ExitCode::from(deepseek_pp_local_runtime::host::canary_main(&args[1..]) as u8);
-        }
-        Some("--emit-burst") => {
-            return ExitCode::from(deepseek_pp_local_runtime::host::canary_main(&args[1..]) as u8);
-        }
-        Some("--spawn-sleeper") => {
-            return ExitCode::from(deepseek_pp_local_runtime::host::canary_main(&args[2..]) as u8);
         }
         Some("--sleep-descendant") => {
             // Legacy descendant mode: sleep only (used by some tests).
