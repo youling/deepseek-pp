@@ -19,11 +19,6 @@ const output = resolve(distDir, `deepseek-plus-plus-${version}-sources.zip`);
 execFileSync('git', ['rev-parse', '--is-inside-work-tree'], { cwd: root, stdio: 'ignore' });
 
 const status = execFileSync('git', ['status', '--porcelain'], { cwd: root, encoding: 'utf8' }).trim();
-const ignoredStatus = execFileSync('git', ['status', '--porcelain', '--ignored'], { cwd: root, encoding: 'utf8' }).trim();
-if (status) {
-  console.error(`[package-sources] git status --porcelain: ${JSON.stringify(status)}`);
-  console.error(`[package-sources] git status --porcelain --ignored: ${JSON.stringify(ignoredStatus.slice(0, 2000))}`);
-}
 if (status && process.env.CI === 'true') {
   throw new Error(`Source package requires a clean git tree in CI (porcelain: ${JSON.stringify(status)})`);
 }
