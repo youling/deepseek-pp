@@ -10,87 +10,60 @@ import { MULTIMODAL_MCP_NATIVE_HOST } from '../../multimodal';
 import { getMultimodalNativeEnv } from '../../multimodal/settings';
 import { SHELL_MCP_NATIVE_HOST } from '../../shell';
 import {
+  NATIVE_MESSAGE_MAX_BYTES,
+  notifyNativeHost,
+  requestNativeHost,
+  type NativeRequestId,
+} from '../../native/request-channel';
+import {
   MCP_NATIVE_ENVELOPE_PROTOCOL,
   MCP_NATIVE_ENVELOPE_VERSION,
   type McpNativeEnvelope,
 } from '../native-contract';
 
-interface PendingRequest {
-  resolve: (value: unknown) => void;
-  reject: (reason: Error) => void;
-  timer: ReturnType<typeof setTimeout>;
-  signal?: AbortSignal;
-  onAbort?: () => void;
-}
+// Port lifecycle, pending correlation, timeout/abort, disconnect cleanup,
+// unmatched-response handling, and the transport ceiling are owned solely by
+// `core/native/request-channel.ts`. This module only owns MCP JSON-RPC
+// envelope semantics on top of that shared channel.
 
-interface NativePortState {
-  port: chrome.runtime.Port;
-  pendingRequests: Map<number | string, PendingRequest>;
-}
-
-// Chrome native messaging enforces a ~1 MB cap per message over the Port
-// (chrome.runtime.Port / connectNative). The previous 9 MB ceiling was never
-// reachable in practice — large payloads were silently truncated or the host
-// disconnected — which surfaced as opaque "QUOTA_BYTES" failures during long
-// content writes (issue #297). Aligning here surfaces the failure early with
-// an actionable message instead.
-const MAX_NATIVE_MESSAGE_BYTES = 1 * 1024 * 1024;
 // local_file_write content cap with headroom for the JSON-RPC envelope. Keep
 // models writing in chunks: write the first section, then append the rest
 // with append=true (issue #297).
 const MAX_LOCAL_FILE_WRITE_BYTES = 900_000;
 
-const nativePortStates = new Map<string, NativePortState>();
-
-function getPortState(nativeHost: string): NativePortState {
-  const existing = nativePortStates.get(nativeHost);
-  if (existing) return existing;
-
-  if (!chrome.runtime?.connectNative) {
-    throw new McpTransportError('mcp_native_messaging_unavailable', 'Browser native messaging is unavailable.', {
-      retryable: false,
-    });
-  }
-
-  const port = chrome.runtime.connectNative(nativeHost);
-  const state: NativePortState = {
-    port,
-    pendingRequests: new Map(),
-  };
-  nativePortStates.set(nativeHost, state);
-
-  port.onMessage.addListener((response: any) => {
-    const id = response?.id ?? response?.result?.id;
-    const rpcId = response?.jsonrpc === '2.0' ? response.id : id;
-    if (rpcId != null && state.pendingRequests.has(rpcId)) {
-      const pending = state.pendingRequests.get(rpcId)!;
-      state.pendingRequests.delete(rpcId);
-      clearTimeout(pending.timer);
-      if (pending.signal && pending.onAbort) {
-        pending.signal.removeEventListener('abort', pending.onAbort);
-      }
-      pending.resolve(response);
-    }
-  });
-
-  port.onDisconnect.addListener(() => {
-    const err = new McpTransportError(
+function createMcpChannelErrors() {
+  return {
+    unavailable: () => new McpTransportError(
+      'mcp_native_messaging_unavailable',
+      'Browser native messaging is unavailable.',
+      { retryable: false },
+    ),
+    disconnected: (detail?: string) => new McpTransportError(
       'mcp_native_host_disconnected',
-      chrome.runtime.lastError?.message || 'Native host disconnected.',
+      detail || 'Native host disconnected.',
       { retryable: true },
-    );
-    for (const pending of state.pendingRequests.values()) {
-      clearTimeout(pending.timer);
-      if (pending.signal && pending.onAbort) {
-        pending.signal.removeEventListener('abort', pending.onAbort);
-      }
-      pending.reject(err);
-    }
-    state.pendingRequests.clear();
-    nativePortStates.delete(nativeHost);
-  });
+    ),
+    timeout: (timeoutMs: number) => new McpTransportError(
+      'mcp_native_timeout',
+      `Native MCP request exceeded ${timeoutMs} ms.`,
+    ),
+    payloadTooLarge: (bytes: number, ceiling: number) => new McpTransportError(
+      'mcp_native_payload_too_large',
+      `Native MCP request is too large (${formatBytes(bytes)} > ${formatBytes(ceiling)}). Reduce the request size or split the work into smaller tool calls.`,
+      { retryable: false },
+    ),
+    aborted: (signal: AbortSignal) => {
+      if (signal.reason instanceof Error) return signal.reason;
+      return new DOMException('Native MCP request was aborted.', 'AbortError');
+    },
+  };
+}
 
-  return state;
+function extractMcpResponseId(response: unknown): NativeRequestId | null | undefined {
+  const record = response as { id?: unknown; jsonrpc?: unknown; result?: { id?: unknown } } | null;
+  if (typeof record !== 'object' || record === null) return undefined;
+  const id = record.jsonrpc === '2.0' ? record.id : (record.id ?? record.result?.id);
+  return typeof id === 'string' || typeof id === 'number' ? id : undefined;
 }
 
 export function createMcpNativeMessagingTransport(server: McpServerConfig): McpProtocolTransport {
@@ -127,12 +100,29 @@ async function sendNativeMessage<TParams extends Record<string, unknown> | undef
   let response: unknown;
   if (expectedRequest) {
     throwIfNativeSignalAborted(signal);
-    response = await sendAndWait(nativeHost, envelope, expectedRequest.id, timeoutMs, signal);
+    response = await requestNativeHost(nativeHost, envelope, {
+      requestId: expectedRequest.id,
+      extractResponseId: extractMcpResponseId,
+      timeoutMs,
+      signal,
+      // Shell requests keep the 1 MiB Chrome Port ceiling enforced twice:
+      // once with shell-specific guidance above, once here as the shared
+      // transport ceiling. Non-shell hosts (e.g. multimodal large images)
+      // preserve the released bypass and are not transport-gated here.
+      maxMessageBytes: nativeHost === SHELL_MCP_NATIVE_HOST
+        ? NATIVE_MESSAGE_MAX_BYTES
+        : Number.POSITIVE_INFINITY,
+      errors: createMcpChannelErrors(),
+    });
     throwIfNativeSignalAborted(signal);
   } else {
     throwIfNativeSignalAborted(signal);
-    const state = getPortState(nativeHost);
-    state.port.postMessage(envelope);
+    // Notifications stay fire-and-forget and preserve the released behavior
+    // of not being size-gated; the shared channel still owns Port lifecycle.
+    notifyNativeHost(nativeHost, envelope, {
+      maxMessageBytes: Number.POSITIVE_INFINITY,
+      errors: createMcpChannelErrors(),
+    });
     return undefined as any;
   }
 
@@ -143,65 +133,6 @@ function throwIfNativeSignalAborted(signal?: AbortSignal): void {
   if (!signal?.aborted) return;
   if (signal.reason instanceof Error) throw signal.reason;
   throw new DOMException('Native MCP request was aborted.', 'AbortError');
-}
-
-function sendAndWait(
-  nativeHost: string,
-  envelope: McpNativeEnvelope,
-  requestId: number | string,
-  timeoutMs: number,
-  signal?: AbortSignal,
-): Promise<unknown> {
-  return new Promise((resolve, reject) => {
-    let state: NativePortState;
-    try {
-      state = getPortState(nativeHost);
-    } catch (err) {
-      reject(err);
-      return;
-    }
-
-    const timer = setTimeout(() => {
-      signal?.removeEventListener('abort', onAbort);
-      state.pendingRequests.delete(requestId);
-      reject(new McpTransportError('mcp_native_timeout', `Native MCP request exceeded ${timeoutMs} ms.`));
-    }, timeoutMs);
-
-    const onAbort = () => {
-      clearTimeout(timer);
-      state.pendingRequests.delete(requestId);
-      const reason = signal?.reason;
-      reject(reason instanceof Error
-        ? reason
-        : new DOMException('Native MCP request was aborted.', 'AbortError'));
-    };
-    if (signal) {
-      if (signal.aborted) {
-        clearTimeout(timer);
-        reject(signal.reason instanceof Error
-          ? signal.reason
-          : new DOMException('Native MCP request was aborted.', 'AbortError'));
-        return;
-      }
-      signal.addEventListener('abort', onAbort, { once: true });
-    }
-
-    state.pendingRequests.set(requestId, {
-      resolve,
-      reject,
-      timer,
-      signal,
-      onAbort: signal ? onAbort : undefined,
-    });
-    try {
-      state.port.postMessage(envelope);
-    } catch (err) {
-      clearTimeout(timer);
-      signal?.removeEventListener('abort', onAbort);
-      state.pendingRequests.delete(requestId);
-      reject(err);
-    }
-  });
 }
 
 async function createNativeEnvelope(
@@ -235,16 +166,16 @@ function assertNativePayloadSize(nativeHost: string, envelope: McpNativeEnvelope
         { retryable: false },
       );
     }
-    if (contentBytes <= MAX_LOCAL_FILE_WRITE_BYTES && contentBytes > MAX_NATIVE_MESSAGE_BYTES / 2) {
+    if (contentBytes <= MAX_LOCAL_FILE_WRITE_BYTES && contentBytes > NATIVE_MESSAGE_MAX_BYTES / 2) {
       return;
     }
   }
 
   const envelopeBytes = new Blob([JSON.stringify(envelope)]).size;
-  if (envelopeBytes > MAX_NATIVE_MESSAGE_BYTES) {
+  if (envelopeBytes > NATIVE_MESSAGE_MAX_BYTES) {
     throw new McpTransportError(
       'mcp_native_payload_too_large',
-      `Native MCP request is too large (${formatBytes(envelopeBytes)} > ${formatBytes(MAX_NATIVE_MESSAGE_BYTES)}). Reduce the request size or split the work into smaller tool calls.`,
+      `Native MCP request is too large (${formatBytes(envelopeBytes)} > ${formatBytes(NATIVE_MESSAGE_MAX_BYTES)}). Reduce the request size or split the work into smaller tool calls.`,
       { retryable: false },
     );
   }

@@ -25,6 +25,15 @@ export interface ToolProviderExecutionContext {
   availableDescriptors?: readonly ToolDescriptor[];
   /** Background-derived capability scope; never populated from a ToolCall payload. */
   capabilityScope?: ToolCapabilityScope;
+  /**
+   * Receiver-owned workspace binding for the Local Runtime canary (P1C2).
+   * Populated only by the background authorization/receiver side (e.g. the
+   * grant's background-validated localSkillDir); never hydrated from
+   * `ToolCall.payload`. When absent, the Rust host falls back to its own
+   * host-owned default workspace. Model/page payload workspace fields are
+   * always ignored.
+   */
+  receiverWorkspaceRoot?: string;
 }
 
 export interface RuntimeToolProvider {

@@ -1,0 +1,57 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://deepseek-pp.local/schema/deepseek-pp-local-runtime.schema.json",
+  "title": "deepseek-pp-local-runtime v1",
+  "description": "Language-neutral contract for the DeepSeek++ Local Coding Runtime native host (com.deepseek_pp.runtime.canary). P1C2: background authorization is the sole authority; grant_id is correlation-only and workspace_id is a background-owned binding hint (both model-invisible). Production advertises canary.echo only; canary.spawn_sleeper is test-internal.",
+  "type": "object",
+  "required": ["protocol", "version", "request_id", "operation"],
+  "additionalProperties": false,
+  "properties": {
+    "protocol": {
+      "const": "deepseek-pp-local-runtime"
+    },
+    "version": {
+      "const": 1
+    },
+    "request_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "operation": {
+      "enum": ["runtime_status", "runtime_exec"]
+    },
+    "grant_id": {
+      "type": "string",
+      "description": "Background-owned internal correlation ticket only (model-invisible). Never authorization evidence; the host never gates on non-empty strings."
+    },
+    "workspace_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096,
+      "description": "Background-owned internal workspace binding hint only (receiver-owned). The host still canonicalizes, verifies existence/directory, and fails closed."
+    },
+    "profile_id": {
+      "type": "string",
+      "description": "Host-owned execution profile. Production: canary.echo only. canary.spawn_sleeper is test-internal (requires DEEPSEEK_PP_RUNTIME_ALLOW_TEST_PROFILES=1)."
+    },
+    "timeout_ms": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 3600000
+    },
+    "max_output_bytes": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1000000
+    },
+    "args": {
+      "type": "array",
+      "maxItems": 8,
+      "items": {
+        "type": "string",
+        "maxLength": 1024
+      }
+    }
+  }
+}
