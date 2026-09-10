@@ -78,7 +78,7 @@ pub fn run_bounded(options: ExecOptions, cancel: &crate::process_tree::CancelTok
         let _ = std::fs::remove_file(&p);
         p
     };
-    let mut barrier_guard = BarrierGuard(Some(barrier_path_buf.clone()));
+    let barrier_guard = BarrierGuard(Some(barrier_path_buf.clone()));
     let barrier_env = (BARRIER_ENV.to_string(), barrier_path_buf.to_string_lossy().into_owned());
 
     let mut cmd = CommandBuilder::new(&options.program);
@@ -112,16 +112,31 @@ pub fn run_bounded(options: ExecOptions, cancel: &crate::process_tree::CancelTok
     let (tx, rx): (Sender<u8>, Receiver<u8>) = mpsc::channel();
     std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
+        let mut zero_streak: u32 = 0;
         loop {
             match reader.read(&mut buf) {
-                Ok(0) | Err(_) => break,
+                Ok(0) => {
+                    zero_streak += 1;
+                    if zero_streak > 20 {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
                 Ok(n) => {
+                    zero_streak = 0;
                     for byte in &buf[..n] {
                         if tx.send(*byte).is_err() {
                             return;
                         }
                     }
                 }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(_) => break,
             }
         }
     });
@@ -140,7 +155,7 @@ pub fn run_bounded(options: ExecOptions, cancel: &crate::process_tree::CancelTok
             timed_out = true;
         }
 
-        drain(rx.recv_timeout(Duration::from_millis(5)), &mut buffer, &mut bytes_seen, max_output);
+        drain(rx.recv_timeout(Duration::from_millis(10)), &mut buffer, &mut bytes_seen, max_output);
 
         match child_for_wait.try_wait() {
             Ok(Some(status)) => {
@@ -229,7 +244,7 @@ fn drain(result: Result<u8, mpsc::RecvTimeoutError>, buffer: &mut Vec<u8>, bytes
 
 fn drain_final(rx: &Receiver<u8>, buffer: &mut Vec<u8>, bytes_seen: &mut u64, max_output: usize) {
     loop {
-        match rx.recv_timeout(Duration::from_millis(20)) {
+        match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(byte) => {
                 *bytes_seen += 1;
                 if buffer.len() < max_output {
@@ -269,17 +284,42 @@ mod tests {
         )
     }
 
+    fn host_bin() -> String {
+        option_env!("CARGO_BIN_EXE_deepseek-pp-local-runtime")
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| {
+                let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("deepseek-pp-local-runtime"));
+                let candidate = exe
+                    .parent()
+                    .and_then(|p| p.parent())
+                    .map(|p| p.join(if cfg!(windows) { "deepseek-pp-local-runtime.exe" } else { "deepseek-pp-local-runtime" }))
+                    .unwrap_or_else(|| std::path::PathBuf::from(if cfg!(windows) { "deepseek-pp-local-runtime.exe" } else { "deepseek-pp-local-runtime" }));
+                let alt = std::path::PathBuf::from(format!(
+                    "target/debug/{}",
+                    if cfg!(windows) { "deepseek-pp-local-runtime.exe" } else { "deepseek-pp-local-runtime" }
+                ));
+                if candidate.exists() {
+                    candidate.to_string_lossy().into_owned()
+                } else if alt.exists() {
+                    alt.to_string_lossy().into_owned()
+                } else {
+                    candidate.to_string_lossy().into_owned()
+                }
+            })
+    }
+
     #[test]
     #[ignore = "real PTY clean exit cannot be demonstrated in the local GNU-Windows env (ADR-001 blocker); run on POSIX CI or Windows MSVC artifact"]
     fn echo_round_trips_bounded_output() {
-        let (program, args): (String, Vec<String>) = if cfg!(windows) {
-            ("cmd".into(), vec!["/C".into(), "echo".into(), "hello-canary".into()])
-        } else {
-            ("sh".into(), vec!["-c".into(), "echo hello-canary".into()])
-        };
-        let outcome = run(&program, args, Duration::from_secs(10), 4096)
+        let program = host_bin();
+        let outcome = run(&program, vec!["--echo-canary".into(), "hello-canary".into()], Duration::from_secs(10), 4096)
             .expect("echo should succeed under PTY");
-        assert!(outcome.output.contains("hello-canary"));
+        assert!(
+            outcome.output.contains("hello-canary"),
+            "output was: {:?} (program={})",
+            outcome.output,
+            program
+        );
         assert_eq!(outcome.exit_code, Some(0));
         assert!(outcome.teardown_confirmed);
     }
@@ -287,28 +327,10 @@ mod tests {
     #[test]
     #[ignore = "real PTY clean exit cannot be demonstrated in the local GNU-Windows env (ADR-001 blocker); run on POSIX CI or Windows MSVC artifact"]
     fn output_budget_is_respected() {
-        let (program, args): (String, Vec<String>) = if cfg!(windows) {
-            (
-                "powershell".into(),
-                vec![
-                    "-NoProfile".into(),
-                    "-Command".into(),
-                    "1..2000 | ForEach-Object { '0123456789012345678901234567890123456789' }".into(),
-                ],
-            )
-        } else {
-            (
-                "sh".into(),
-                vec![
-                    "-c".into(),
-                    "i=0; while [ $i -lt 2000 ]; do printf '0123456789012345678901234567890123456789'; i=$((i+1)); done".into(),
-                ],
-            )
-        };
-        let outcome = run(&program, args, Duration::from_secs(20), 4096)
-            .expect("burst should run");
-        assert!(outcome.output.len() <= 4096);
-        assert!(outcome.bytes_seen > 4096);
+        let program = host_bin();
+        let outcome = run(&program, vec!["--emit-burst".into()], Duration::from_secs(20), 4096).expect("burst should run");
+        assert!(outcome.output.len() <= 4096, "retained {}", outcome.output.len());
+        assert!(outcome.bytes_seen > 4096, "bytes_seen {} should exceed cap", outcome.bytes_seen);
         assert!(outcome.more_available());
         assert!(outcome.teardown_confirmed);
     }
@@ -316,14 +338,9 @@ mod tests {
     #[test]
     #[ignore = "real PTY clean exit cannot be demonstrated in the local GNU-Windows env (ADR-001 blocker); run on POSIX CI or Windows MSVC artifact"]
     fn non_zero_exit_is_reported() {
-        let (program, args): (String, Vec<String>) = if cfg!(windows) {
-            ("cmd".into(), vec!["/C".into(), "exit".into(), "7".into()])
-        } else {
-            ("sh".into(), vec!["-c".into(), "exit 7".into()])
-        };
-        let outcome = run(&program, args, Duration::from_secs(10), 4096)
-            .expect("exit should run");
-        assert_eq!(outcome.exit_code, Some(7));
+        let program = host_bin();
+        let outcome = run(&program, vec!["--exit-code".into(), "7".into()], Duration::from_secs(10), 4096).expect("exit should run");
+        assert_eq!(outcome.exit_code, Some(7), "output: {:?}", outcome.output);
         assert!(outcome.teardown_confirmed);
     }
 

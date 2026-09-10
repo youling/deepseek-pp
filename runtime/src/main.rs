@@ -10,6 +10,12 @@ fn main() -> ExitCode {
         Some("--echo-canary") => {
             return ExitCode::from(deepseek_pp_local_runtime::host::canary_main(&args[2..]) as u8);
         }
+        Some("--exit-code") => {
+            return ExitCode::from(deepseek_pp_local_runtime::host::canary_main(&args[1..]) as u8);
+        }
+        Some("--emit-burst") => {
+            return ExitCode::from(deepseek_pp_local_runtime::host::canary_main(&args[1..]) as u8);
+        }
         Some("--spawn-sleeper") => {
             return ExitCode::from(deepseek_pp_local_runtime::host::canary_main(&args[2..]) as u8);
         }

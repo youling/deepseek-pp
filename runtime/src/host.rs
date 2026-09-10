@@ -223,6 +223,16 @@ pub fn canary_main(args: &[String]) -> i32 {
         println!("deepseek-pp canary echo: {}", rest.join(" "));
         return 0;
     }
+    if let Some(pos) = args.iter().position(|a| a == "--exit-code") {
+        let code: i32 = args.get(pos + 1).and_then(|v| v.parse().ok()).unwrap_or(1);
+        std::process::exit(code);
+    }
+    if args.iter().any(|a| a == "--emit-burst") {
+        for _ in 0..2000 {
+            println!("0123456789012345678901234567890123456789");
+        }
+        return 0;
+    }
     if let Some(pos) = args.iter().position(|a| a == "--spawn-sleeper") {
         let sleep_ms: u64 = args.get(pos + 1).and_then(|v| v.parse().ok()).unwrap_or(5000);
         spawn_descendant_sleeper(sleep_ms);
