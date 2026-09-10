@@ -60,19 +60,47 @@ pub fn profiles() -> Vec<String> {
 
 /// Returns the host-owned executable + args for a profile. The command is
 /// defined by the host, never by the browser.
+///
+/// Windows ConPTY boundary isolation (P1B3): the canary helper is a plain
+/// Rust binary that does not handle ConPTY's initial DSR (`\x1b[6n`) and
+/// hangs when spawned directly as a ConPTY client (observed as 4-byte
+/// output + timeout, CI 34456939702). Wrapping the helper via `cmd /C`
+/// makes `cmd.exe` the ConPTY client (which correctly answers DSR) and the
+/// helper runs as a normal child of `cmd`. The helper then inherits the
+/// Job Object membership from `cmd`, so real process-tree ownership is
+/// retained. We use the absolute `C:\Windows\System32\cmd.exe` path to
+/// avoid `CommandBuilder::search_path` issues inside `cargo test` where
+/// `PATH` may be polluted.
 fn profile_command(profile: &str, args: &[String]) -> Option<(String, Vec<String>)> {
     let me = std::env::current_exe().ok()?;
     let me = me.to_string_lossy().into_owned();
+    let cmd = if cfg!(windows) {
+        std::env::var("ComSpec").unwrap_or_else(|_| r"C:\Windows\System32\cmd.exe".to_string())
+    } else {
+        "cmd".to_string()
+    };
     match profile {
         CANARY_PROFILE => {
-            let mut v = vec!["--echo-canary".to_string()];
-            v.extend_from_slice(args);
-            Some((me, v))
+            if cfg!(windows) {
+                let mut v = vec!["/C".to_string(), me, "--echo-canary".to_string()];
+                v.extend_from_slice(args);
+                Some((cmd, v))
+            } else {
+                let mut v = vec!["--echo-canary".to_string()];
+                v.extend_from_slice(args);
+                Some((me, v))
+            }
         }
         CANARY_SPAWN_SLEEPER_PROFILE => {
-            let mut v = vec!["--spawn-sleeper".to_string()];
-            v.extend_from_slice(args);
-            Some((me, v))
+            if cfg!(windows) {
+                let mut v = vec!["/C".to_string(), me, "--spawn-sleeper".to_string()];
+                v.extend_from_slice(args);
+                Some((cmd, v))
+            } else {
+                let mut v = vec!["--spawn-sleeper".to_string()];
+                v.extend_from_slice(args);
+                Some((me, v))
+            }
         }
         _ => None,
     }

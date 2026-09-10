@@ -231,6 +231,29 @@ impl ProcessTreeGuard {
     pub fn is_confirmed(&self) -> bool {
         self.confirmed.load(Ordering::SeqCst)
     }
+
+    /// Test-only introspection: number of live processes owned by the tree.
+    /// Used by P1B3 A/B/C diagnostics and teardown tests to prove a descendant
+    /// exists and is later gone. Never used to claim success unless confirming
+    /// zero.
+    #[doc(hidden)]
+    pub fn live_process_count(&self) -> u64 {
+        #[cfg(windows)]
+        {
+            match &self.job {
+                Some(j) => crate::process_tree::windows_job::active_process_count(j).unwrap_or(u64::MAX),
+                None => u64::MAX,
+            }
+        }
+        #[cfg(unix)]
+        {
+            if crate::process_tree::unix_tree::group_is_empty(self.pgid) { 0 } else { 1 }
+        }
+        #[cfg(not(any(windows, unix)))]
+        {
+            0
+        }
+    }
 }
 
 #[cfg(unix)]
