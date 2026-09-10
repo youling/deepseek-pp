@@ -46,12 +46,40 @@ pub struct ExecOptions {
     pub max_output_bytes: usize,
 }
 
+const BARRIER_ENV: &str = "DEEPSEEK_PP_RUNTIME_BARRIER_FILE";
+
+struct BarrierGuard(Option<std::path::PathBuf>);
+impl Drop for BarrierGuard {
+    fn drop(&mut self) {
+        if let Some(p) = self.0.take() {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
 /// PTY-backed, bounded, teardown-confirmed execution.
 pub fn run_bounded(options: ExecOptions, cancel: &crate::process_tree::CancelToken) -> Result<RunOutcome, ExecuteError> {
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
         .map_err(|e| ExecuteError::Spawn(format!("openpty: {}", e)))?;
+
+    let barrier_path_buf = {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let p = std::env::temp_dir().join(format!(
+            "deepseek-pp-runtime-barrier-{}-{}-{}.ready",
+            std::process::id(),
+            nanos,
+            crate::util::next_barrier_counter()
+        ));
+        let _ = std::fs::remove_file(&p);
+        p
+    };
+    let mut barrier_guard = BarrierGuard(Some(barrier_path_buf.clone()));
+    let barrier_env = (BARRIER_ENV.to_string(), barrier_path_buf.to_string_lossy().into_owned());
 
     let mut cmd = CommandBuilder::new(&options.program);
     cmd.args(&options.args);
@@ -61,6 +89,7 @@ pub fn run_bounded(options: ExecOptions, cancel: &crate::process_tree::CancelTok
     for (k, v) in &options.env {
         cmd.env(k, v);
     }
+    cmd.env(barrier_env.0.clone(), barrier_env.1.clone());
 
     let child = pair
         .slave
@@ -68,14 +97,12 @@ pub fn run_bounded(options: ExecOptions, cancel: &crate::process_tree::CancelTok
         .map_err(|e| ExecuteError::Spawn(format!("spawn: {}", e)))?;
     let pid = child.process_id().unwrap_or(0);
 
-    // Drop the slave handle so that EOF is signalled on the master when the
-    // whole console session (tree) closes.
     drop(pair.slave);
     let master = &pair.master;
 
-    // Supervise the process tree (Windows Job Object / POSIX process group).
     let mut guard = crate::process_tree::ProcessTreeGuard::supervise(pid)
         .map_err(|e| ExecuteError::Spawn(format!("supervise: {}", e)))?;
+    let _ = std::fs::write(&barrier_path_buf, b"ready");
 
     let mut reader = master
         .try_clone_reader()
@@ -83,12 +110,6 @@ pub fn run_bounded(options: ExecOptions, cancel: &crate::process_tree::CancelTok
     let max_output = options.max_output_bytes;
 
     let (tx, rx): (Sender<u8>, Receiver<u8>) = mpsc::channel();
-    // Reader thread is detached (never joined): the concrete PTY read may not
-    // reach EOF on some platforms even after the child exits (ConPTY holds the
-    // master open), so joining could deadlock. The thread exits on its own when
-    // the master handle is released and EOF finally arrives, and is necessarily
-    // reclaimed when the process exits. Bounded output is collected from `rx`
-    // in the main loop, so detaching never loses data already produced.
     std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
         loop {
@@ -125,28 +146,32 @@ pub fn run_bounded(options: ExecOptions, cancel: &crate::process_tree::CancelTok
             Ok(Some(status)) => {
                 drain_final(&rx, &mut buffer, &mut bytes_seen, max_output);
                 let (exit_code, signal_name) = status_to_code(&status);
+                if let Err(e) = guard.confirm_clean_exit() {
+                    drop(barrier_guard);
+                    return Err(ExecuteError::UnconfirmedTeardown(format!(
+                        "clean-exit teardown not confirmed: {}",
+                        e
+                    )));
+                }
+                drop(barrier_guard);
                 return Ok(RunOutcome {
                     timed_out,
                     cancelled: false,
                     exit_code,
                     signal_name,
-                    teardown_confirmed: true,
+                    teardown_confirmed: guard.is_confirmed(),
                     bytes_seen,
                     output: String::from_utf8_lossy(&buffer).to_string(),
                 });
             }
             Ok(None) => {}
-            Err(_) => {
+            Err(e) => {
                 drain_final(&rx, &mut buffer, &mut bytes_seen, max_output);
-                return Ok(RunOutcome {
-                    timed_out,
-                    cancelled: false,
-                    exit_code: None,
-                    signal_name: None,
-                    teardown_confirmed: true,
-                    bytes_seen,
-                    output: String::from_utf8_lossy(&buffer).to_string(),
-                });
+                drop(barrier_guard);
+                return Err(ExecuteError::UnconfirmedTeardown(format!(
+                    "try_wait failed: {} (teardown not confirmed)",
+                    e
+                )));
             }
         }
 
@@ -163,17 +188,15 @@ fn teardown_mid_run(
     timed_out: bool,
     cancelled: bool,
 ) -> Result<RunOutcome, ExecuteError> {
-    // Request cancellation of the owned process tree (Job Object / group) and
-    // verify no owned process remains. This is the fail-closed teardown gate:
-    // success is only claimed if the host confirms the owned tree is gone.
+    let mut buffer: Vec<u8> = Vec::new();
+    let _ = bytes_seen;
     let kill_result = guard.cancel_tree();
-    // Drain whatever output arrived without blocking forever.
-    let mut _buffer: Vec<u8> = Vec::new();
-    for _ in 0..64 {
+    for _ in 0..32 {
         if rx.recv_timeout(Duration::from_millis(10)).is_err() {
             break;
         }
     }
+    let _ = &mut buffer;
 
     match kill_result {
         Ok(()) if guard.is_confirmed() => Ok(RunOutcome {
@@ -185,9 +208,13 @@ fn teardown_mid_run(
             bytes_seen,
             output: String::new(),
         }),
-        _ => Err(ExecuteError::UnconfirmedTeardown(
-            "owned process tree could not be confirmed terminated".into(),
+        Ok(()) => Err(ExecuteError::UnconfirmedTeardown(
+            "owned process tree could not be confirmed terminated (not confirmed)".into(),
         )),
+        Err(e) => Err(ExecuteError::UnconfirmedTeardown(format!(
+            "owned process tree teardown failed: {}",
+            e
+        ))),
     }
 }
 
@@ -245,13 +272,13 @@ mod tests {
     #[test]
     #[ignore = "real PTY clean exit cannot be demonstrated in the local GNU-Windows env (ADR-001 blocker); run on POSIX CI or Windows MSVC artifact"]
     fn echo_round_trips_bounded_output() {
-        let outcome = run(
-            "cmd",
-            vec!["/C".into(), "echo".into(), "hello-canary".into()],
-            Duration::from_secs(10),
-            4096,
-        )
-        .expect("echo should succeed under PTY");
+        let (program, args): (String, Vec<String>) = if cfg!(windows) {
+            ("cmd".into(), vec!["/C".into(), "echo".into(), "hello-canary".into()])
+        } else {
+            ("sh".into(), vec!["-c".into(), "echo hello-canary".into()])
+        };
+        let outcome = run(&program, args, Duration::from_secs(10), 4096)
+            .expect("echo should succeed under PTY");
         assert!(outcome.output.contains("hello-canary"));
         assert_eq!(outcome.exit_code, Some(0));
         assert!(outcome.teardown_confirmed);
@@ -260,17 +287,26 @@ mod tests {
     #[test]
     #[ignore = "real PTY clean exit cannot be demonstrated in the local GNU-Windows env (ADR-001 blocker); run on POSIX CI or Windows MSVC artifact"]
     fn output_budget_is_respected() {
-        let outcome = run(
-            "powershell",
-            vec![
-                "-NoProfile".into(),
-                "-Command".into(),
-                "1..2000 | ForEach-Object { '0123456789012345678901234567890123456789' }".into(),
-            ],
-            Duration::from_secs(20),
-            4096,
-        )
-        .expect("burst should run");
+        let (program, args): (String, Vec<String>) = if cfg!(windows) {
+            (
+                "powershell".into(),
+                vec![
+                    "-NoProfile".into(),
+                    "-Command".into(),
+                    "1..2000 | ForEach-Object { '0123456789012345678901234567890123456789' }".into(),
+                ],
+            )
+        } else {
+            (
+                "sh".into(),
+                vec![
+                    "-c".into(),
+                    "i=0; while [ $i -lt 2000 ]; do printf '0123456789012345678901234567890123456789'; i=$((i+1)); done".into(),
+                ],
+            )
+        };
+        let outcome = run(&program, args, Duration::from_secs(20), 4096)
+            .expect("burst should run");
         assert!(outcome.output.len() <= 4096);
         assert!(outcome.bytes_seen > 4096);
         assert!(outcome.more_available());
@@ -280,14 +316,20 @@ mod tests {
     #[test]
     #[ignore = "real PTY clean exit cannot be demonstrated in the local GNU-Windows env (ADR-001 blocker); run on POSIX CI or Windows MSVC artifact"]
     fn non_zero_exit_is_reported() {
-        let outcome = run(
-            "cmd",
-            vec!["/C".into(), "exit".into(), "7".into()],
-            Duration::from_secs(10),
-            4096,
-        )
-        .expect("exit should run");
+        let (program, args): (String, Vec<String>) = if cfg!(windows) {
+            ("cmd".into(), vec!["/C".into(), "exit".into(), "7".into()])
+        } else {
+            ("sh".into(), vec!["-c".into(), "exit 7".into()])
+        };
+        let outcome = run(&program, args, Duration::from_secs(10), 4096)
+            .expect("exit should run");
         assert_eq!(outcome.exit_code, Some(7));
         assert!(outcome.teardown_confirmed);
+    }
+
+    #[test]
+    fn try_wait_error_is_fail_closed() {
+        let err = ExecuteError::UnconfirmedTeardown("test".into());
+        assert!(format!("{}", err).contains("teardown"));
     }
 }

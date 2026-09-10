@@ -122,7 +122,23 @@ pub fn handle_exec(request: RuntimeRequest) -> Envelope {
         }
     };
 
-    let workspace_id = request.workspace_id.clone().unwrap_or_else(|| "(none)".into());
+    // The wire's workspace_id is metadata only; the cwd is host-bound,
+    // canonical, and P1C-ready. Model cannot select an absolute path.
+    let workspace_hint = request.workspace_id.clone();
+    let workspace_log = workspace_hint.clone().unwrap_or_else(|| "(none)".into());
+    let bound_root = match crate::workspace::resolve_for_exec(workspace_hint.as_deref()) {
+        Ok(p) => p,
+        Err(e) => {
+            return Envelope::err(
+                req_id,
+                "runtime.exec",
+                "runtime_workspace_unavailable",
+                format!("host workspace unavailable: {}", e),
+                true,
+            );
+        }
+    };
+    let cwd_str = bound_root.to_string_lossy().into_owned();
     let timeout = request.timeout_ms.unwrap_or(10_000);
     let budget = request.max_output_bytes.unwrap_or(4096);
 
@@ -144,13 +160,11 @@ pub fn handle_exec(request: RuntimeRequest) -> Envelope {
         crate::executor::ExecOptions {
             program,
             args,
-            cwd: std::env::current_dir()
-                .ok()
-                .map(|p| p.to_string_lossy().into_owned()),
+            cwd: Some(cwd_str),
             env: vec![
                 ("DEEPSEEK_PP_RUNTIME_GRANT".to_string(), grant),
                 ("DEEPSEEK_PP_RUNTIME_PROFILE".to_string(), profile),
-                ("DEEPSEEK_PP_RUNTIME_WORKSPACE".to_string(), workspace_id),
+                ("DEEPSEEK_PP_RUNTIME_WORKSPACE".to_string(), workspace_log),
             ],
             timeout: Duration::from_millis(timeout),
             max_output_bytes: budget,
@@ -222,7 +236,23 @@ pub fn canary_main(args: &[String]) -> i32 {
 /// process-group teardown test has a true process tree. The descendant is
 /// created by the leader AFTER the leader is already assigned to the Job
 /// Object, so inheritance places it in the same job.
+///
+/// The executor's per-run barrier (`DEEPSEEK_PP_RUNTIME_BARRIER_FILE`) is used
+/// to close the spawn→assign escape race: after `portable-pty` forks the
+/// leader and before the descendant is created, the leader waits until the
+/// host confirms supervision succeeded and touches the barrier file.
 fn spawn_descendant_sleeper(sleep_ms: u64) {
+    const BARRIER_ENV: &str = "DEEPSEEK_PP_RUNTIME_BARRIER_FILE";
+    if let Ok(barrier) = std::env::var(BARRIER_ENV) {
+        let path = std::path::PathBuf::from(barrier);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if path.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
     let descriptor = descendant_cmd();
     if let Some(mut cmd) = descriptor {
         let _ = cmd.spawn();

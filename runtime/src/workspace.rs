@@ -39,6 +39,47 @@ pub fn resolve_workspace_root(root: &Path) -> Result<PathBuf, WorkspaceError> {
     Ok(canonical)
 }
 
+/// Host-owned dev-registered workspace root for P1 canary exec.
+///
+/// This is the **internal binding point** that P1C will later feed from the
+/// extension background's human-owned/dev-registered workspace (e.g. picker or
+/// config). The model payload (`workspace_id`/`path`) is **never** consulted
+/// for the cwd; it is at most audit metadata. The host always canonicalizes
+/// and re-validates the bound root before execution.
+///
+/// Resolution order (host authority, not model authority):
+/// 1. Env `DEEPSEEK_PP_CANARY_WORKSPACE_ROOT` if set and non-empty: must
+///    canonicalize to an existing directory (fail-closed otherwise).
+/// 2. Otherwise, the host-owned default `std::env::temp_dir()/deepseek-pp-canary-workspace`,
+///    created if missing and then canonicalized.
+///
+/// The returned path is always canonical and confined (reparse/symlink
+/// resolved). Callers must use it as the only cwd authority.
+pub fn bound_workspace_root() -> Result<PathBuf, WorkspaceError> {
+    if let Ok(env_root) = std::env::var("DEEPSEEK_PP_CANARY_WORKSPACE_ROOT") {
+        let trimmed = env_root.trim();
+        if !trimmed.is_empty() {
+            let p = PathBuf::from(trimmed);
+            return resolve_workspace_root(&p);
+        }
+    }
+    let default_root = std::env::temp_dir().join("deepseek-pp-canary-workspace");
+    fs::create_dir_all(&default_root)
+        .map_err(|e| WorkspaceError::Unresolvable(format!("{}: {}", default_root.display(), e)))?;
+    resolve_workspace_root(&default_root)
+}
+
+/// Resolve the host-bound workspace for an exec request.
+///
+/// The `workspace_hint` (from the wire's `workspace_id`) is intentionally
+/// ignored for path resolution; it is metadata only. The cwd comes from
+/// `bound_workspace_root()` and is verified canonical before use. This makes
+/// the interface ready for P1C where the background will inject a typed
+/// bound root rather than a model string.
+pub fn resolve_for_exec(_workspace_hint: Option<&str>) -> Result<PathBuf, WorkspaceError> {
+    bound_workspace_root()
+}
+
 /// Resolve a candidate path and return it along with the resolved ancestor
 /// used for containment, WITHOUT mixing the check with the open. The caller
 /// may use the resolved path as a base but must not treat this as a race-free
@@ -227,6 +268,29 @@ mod tests {
         }
     }
 
+    #[test]
+    fn bound_workspace_is_host_owned_and_ignores_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let canary = dir.path().join("my-canary-root");
+        fs::create_dir_all(&canary).unwrap();
+        let canonical = fs::canonicalize(&canary).unwrap();
+        std::env::set_var("DEEPSEEK_PP_CANARY_WORKSPACE_ROOT", &canonical);
+        let resolved = resolve_for_exec(Some("/tmp/evil/../escape"))
+            .expect("bound workspace should succeed via host env");
+        assert_eq!(resolved, canonical);
+        assert!(!resolved.to_string_lossy().contains("evil"));
+        std::env::remove_var("DEEPSEEK_PP_CANARY_WORKSPACE_ROOT");
+    }
+
+    #[test]
+    fn bound_workspace_default_is_host_owned_when_env_absent() {
+        std::env::remove_var("DEEPSEEK_PP_CANARY_WORKSPACE_ROOT");
+        let resolved = bound_workspace_root().expect("default host workspace must exist");
+        assert!(resolved.exists());
+        assert!(resolved.is_absolute());
+        assert!(resolved.to_string_lossy().contains("deepseek-pp-canary-workspace"));
+    }
+
     #[cfg(windows)]
     fn create_junction(link: &Path, target: &Path) -> bool {
         use std::os::windows::process::CommandExt;
@@ -245,5 +309,10 @@ mod tests {
             Ok(s) => s.success(),
             Err(_) => false,
         }
+    }
+
+    #[cfg(not(windows))]
+    fn create_junction(_link: &Path, _target: &Path) -> bool {
+        false
     }
 }

@@ -3,6 +3,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static RUN_COUNTER: AtomicU64 = AtomicU64::new(0);
+static BARRIER_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Stable run identity: monotonic counter plus pid and a wall-clock component
 /// (not cryptographically random, but stable and unique for a process lifetime).
@@ -14,6 +15,10 @@ pub fn new_run_id() -> String {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     format!("run-{}-{}-{}", pid, nanos, counter)
+}
+
+pub fn next_barrier_counter() -> u64 {
+    BARRIER_COUNTER.fetch_add(1, Ordering::SeqCst)
 }
 
 #[cfg(test)]
