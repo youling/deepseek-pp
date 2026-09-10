@@ -34,7 +34,7 @@ It is not selected as the primary runtime because:
 
 Node remains a valid development/reference implementation and a possible rollback artifact while the Rust host is canaried. It is not a second active authority: only one host artifact is registered for the host name at a time.
 
-### B. Rust native binary — selected
+### B. Rust native binary 鈥?selected
 
 Rust produces a native executable without a user-installed Node/Python/uv/pipx prerequisite and has direct, mature access to OS process, handle, filesystem, and signal APIs. `portable-pty` exposes a cross-platform PTY interface and has Windows and Unix implementations; Tokio provides async pipes, cancellation plumbing, and bounded streaming building blocks; the remaining process-tree guarantees can be made explicit in small Windows/Unix adapters rather than hidden in a general-purpose agent framework.
 
@@ -200,4 +200,3 @@ P1 acceptance criteria:
 - DeepSeek Harness MCP client: <https://github.com/deepseek-ai/deepseek-harness/tree/master/packages/mcp/mcp-client>
 - MCP Bridge reference: <https://github.com/scmypapa/mcp-bridge>
 - Serena reference: <https://github.com/oraios/serena>
-
