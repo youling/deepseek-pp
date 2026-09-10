@@ -15,6 +15,7 @@
  */
 
 import type { JsonValue, ToolCall, ToolDescriptor, ToolResult } from '../tool/types';
+import type { ToolProviderExecutionContext } from '../tool/provider-registry';
 import {
   LOCAL_RUNTIME_CANARY_PROFILE,
   LOCAL_RUNTIME_HOST_ID,
@@ -64,21 +65,12 @@ export function createLocalRuntimeToolDescriptors(_locale: string): ToolDescript
       inputSchema: {
         type: 'object',
         properties: {
-          grant_id: {
-            type: 'string',
-            description: '后台签发的授权引用；宿主要求非空，直接页面调用会被拒绝。',
-          },
-          profile_id: {
-            type: 'string',
-            description: '宿主拥有且可执行的画像。缺省为 canary.echo。',
-          },
           args: {
             type: 'array',
             items: { type: 'string' },
-            description: '传给画像的参数（受宿主每请求上限约束）。',
+            description: '传给 canary.echo 的参数（UTF-8 每项≤1024 字节，总请求≤64 KiB）。',
           },
         },
-        required: ['grant_id'],
         additionalProperties: false,
       },
       execution: {
@@ -95,6 +87,7 @@ export function createLocalRuntimeToolDescriptors(_locale: string): ToolDescript
 export async function executeLocalRuntimeToolCall(
   call: ToolCall,
   descriptor: ToolDescriptor,
+  context?: ToolProviderExecutionContext,
 ): Promise<ToolResult> {
   const startedAt = Date.now();
   try {
@@ -121,24 +114,24 @@ export async function executeLocalRuntimeToolCall(
     }
 
     if (descriptor.id === 'local-runtime.exec') {
-      const payload = call.payload as {
-        grant_id?: unknown;
-        profile_id?: unknown;
-        args?: unknown;
-      };
-      const grantId = typeof payload.grant_id === 'string' && payload.grant_id.length > 0
-        ? payload.grant_id
-        : undefined;
-      if (!grantId) {
+      // Authority is background-owned capabilityScope (grant/trusted), never payload.
+      // Model/page-injected grant_id/profile_id/workspace_id/path are ignored.
+      const rawPayload = call.payload as Record<string, unknown> | undefined;
+      const args = Array.isArray(rawPayload?.args)
+        ? (rawPayload.args as unknown[]).filter((arg): arg is string => typeof arg === 'string')
+        : [];
+
+      const capabilityScope = context?.capabilityScope;
+      if (!capabilityScope) {
         return {
           ok: false,
-          summary: '缺少后台授权引用（grant_id），宿主拒绝执行。直接页面调用不可达。',
+          summary: '缺少后台授权（capabilityScope），宿主拒绝执行。',
           descriptorId: descriptor.id,
           provider: { ...LOCAL_RUNTIME_TOOL_PROVIDER },
           name: call.name,
           error: {
-            code: 'runtime_grant_missing',
-            message: 'A background-issued grant_id is required to execute on the Local Runtime host.',
+            code: 'runtime_authorization_missing',
+            message: 'Local Runtime execution requires a background-owned capabilityScope.',
             retryable: false,
           },
           startedAt,
@@ -147,15 +140,12 @@ export async function executeLocalRuntimeToolCall(
         };
       }
 
-      const profileId = typeof payload.profile_id === 'string' && payload.profile_id.length > 0
-        ? payload.profile_id
-        : LOCAL_RUNTIME_CANARY_PROFILE;
-      const args = Array.isArray(payload.args)
-        ? payload.args.filter((arg): arg is string => typeof arg === 'string')
-        : [];
+      // Internal correlation ticket derived from receiver-owned scope — not model authority.
+      const internalGrantId = `lr:${capabilityScope.scopeId}`;
+      const profileId = LOCAL_RUNTIME_CANARY_PROFILE;
 
       const envelope = await localRuntimeExec({
-        grantId,
+        grantId: internalGrantId,
         profileId,
         args,
         maxOutputBytes: 128_000,

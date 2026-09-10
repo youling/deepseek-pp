@@ -22,6 +22,8 @@ import type {
 } from './contract';
 import {
   LOCAL_RUNTIME_HOST_ID,
+  LocalRuntimeContractError,
+  validateLocalRuntimeEnvelope,
   validateLocalRuntimeRequest,
 } from './contract';
 import {
@@ -79,9 +81,9 @@ function extractLocalRuntimeResponseId(response: unknown): NativeRequestId | nul
 
 /**
  * Send a validated Local Runtime request and await the correlated response.
- * Validates the outgoing request at the TS trust boundary before it is posted.
- * Transport ceiling / correlation / timeout / abort / disconnect are owned by
- * the shared native request channel.
+ * Validates outgoing request (UTF-8 args + 64 KiB ceiling) and strict
+ * incoming envelope (protocol/version/request_id/operation/host/result/error
+ * and byte invariants) after shared-channel correlation.
  */
 export function sendLocalRuntimeRequest(
   request: LocalRuntimeRequest,
@@ -89,13 +91,24 @@ export function sendLocalRuntimeRequest(
 ): Promise<LocalRuntimeEnvelope> {
   validateLocalRuntimeRequest(request);
 
+  const expectedOperation = request.operation === 'runtime_status' ? 'runtime.status' as const : 'runtime.exec' as const;
   const timeoutMs = options?.timeoutMs ?? 5_000;
-  return requestNativeHost<LocalRuntimeEnvelope>(LOCAL_RUNTIME_HOST_ID, request, {
+  return requestNativeHost<unknown>(LOCAL_RUNTIME_HOST_ID, request, {
     requestId: request.request_id,
     extractResponseId: extractLocalRuntimeResponseId,
     timeoutMs,
     signal: options?.signal,
     errors: createLocalRuntimeChannelErrors(),
+  }).then((raw) => {
+    try {
+      validateLocalRuntimeEnvelope(raw, { requestId: request.request_id, operation: expectedOperation });
+    } catch (err) {
+      if (err instanceof LocalRuntimeContractError) {
+        throw new LocalRuntimeClientError('local_runtime_unknown_error', err.message, { cause: err });
+      }
+      throw err;
+    }
+    return raw as LocalRuntimeEnvelope;
   });
 }
 
