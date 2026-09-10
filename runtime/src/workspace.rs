@@ -69,14 +69,41 @@ pub fn bound_workspace_root() -> Result<PathBuf, WorkspaceError> {
     resolve_workspace_root(&default_root)
 }
 
-/// Resolve the host-bound workspace for an exec request.
+/// Resolve the host-bound workspace for an exec request (P1C2).
 ///
-/// The `workspace_hint` (from the wire's `workspace_id`) is intentionally
-/// ignored for path resolution; it is metadata only. The cwd comes from
-/// `bound_workspace_root()` and is verified canonical before use. This makes
-/// the interface ready for P1C where the background will inject a typed
-/// bound root rather than a model string.
-pub fn resolve_for_exec(_workspace_hint: Option<&str>) -> Result<PathBuf, WorkspaceError> {
+/// The `workspace_hint` (from the wire's `workspace_id`) is a background-owned
+/// internal binding hint only — never model authority. When present and
+/// non-empty, the host realpath/canonicalizes it, verifies it exists and is a
+/// directory, and fails closed otherwise. A browser/model-supplied path is
+/// never a trust fact. When absent, the cwd comes from `bound_workspace_root()`
+/// (host-owned default) and is verified canonical before use.
+pub fn resolve_for_exec(workspace_hint: Option<&str>) -> Result<PathBuf, WorkspaceError> {
+    if let Some(hint) = workspace_hint {
+        let trimmed = hint.trim();
+        if !trimmed.is_empty() {
+            if trimmed.contains('\0') {
+                return Err(WorkspaceError::Unresolvable(
+                    "workspace binding contains NUL".into(),
+                ));
+            }
+            let candidate = PathBuf::from(trimmed);
+            if !candidate.is_absolute() {
+                return Err(WorkspaceError::Unresolvable(format!(
+                    "background workspace binding must be absolute: {}",
+                    trimmed
+                )));
+            }
+            let canonical = fs::canonicalize(&candidate).map_err(|e| {
+                WorkspaceError::Unresolvable(format!("{}: {}", candidate.display(), e))
+            })?;
+            if !canonical.is_dir() {
+                return Err(WorkspaceError::Missing(
+                    canonical.to_string_lossy().into_owned(),
+                ));
+            }
+            return Ok(canonical);
+        }
+    }
     bound_workspace_root()
 }
 
@@ -269,17 +296,35 @@ mod tests {
     }
 
     #[test]
-    fn bound_workspace_is_host_owned_and_ignores_payload() {
+    fn background_binding_is_honored_when_valid_and_fails_closed_when_invalid() {
+        // P1C2: workspace_id is a background-owned internal hint. A valid
+        // absolute, existing directory is honored after canonicalization;
+        // an invalid/missing path fails closed and never falls back silently.
         let dir = tempfile::tempdir().unwrap();
         let canary = dir.path().join("my-canary-root");
         fs::create_dir_all(&canary).unwrap();
         let canonical = fs::canonicalize(&canary).unwrap();
-        std::env::set_var("DEEPSEEK_PP_CANARY_WORKSPACE_ROOT", &canonical);
-        let resolved = resolve_for_exec(Some("/tmp/evil/../escape"))
-            .expect("bound workspace should succeed via host env");
+        let resolved = resolve_for_exec(Some(canonical.to_string_lossy().as_ref()))
+            .expect("valid background binding must succeed");
         assert_eq!(resolved, canonical);
-        assert!(!resolved.to_string_lossy().contains("evil"));
-        std::env::remove_var("DEEPSEEK_PP_CANARY_WORKSPACE_ROOT");
+
+        let missing = dir.path().join("does-not-exist-zzz");
+        assert!(resolve_for_exec(Some(missing.to_string_lossy().as_ref())).is_err());
+
+        // Relative paths are never trusted, even from the background wire:
+        // they fail closed rather than resolving against the host default.
+        assert!(resolve_for_exec(Some("relative/path")).is_err());
+    }
+
+    #[test]
+    fn absent_hint_falls_back_to_host_owned_default() {
+        let resolved_none =
+            resolve_for_exec(None).expect("absent hint must use host default");
+        assert!(resolved_none.exists());
+        assert!(resolved_none.is_absolute());
+        let resolved_empty =
+            resolve_for_exec(Some("   ")).expect("empty hint must use host default");
+        assert!(resolved_empty.exists());
     }
 
     #[test]

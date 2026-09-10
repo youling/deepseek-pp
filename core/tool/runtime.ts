@@ -186,6 +186,12 @@ async function executeRuntimeToolCall(
   let resolvedCall = authorized.call;
   let executionDescriptor = authorized.descriptor;
   let providerCompleted = false;
+  // P1C2 receiver-owned workspace binding: derived only from the background
+  // grant (background-validated localSkillDir), never from ToolCall.payload.
+  // When absent, the Rust host uses its own host-owned default workspace.
+  const receiverWorkspaceRoot = authorized.externalPayloadNamespace
+    ? await getGrantLocalSkillDir(authorized.externalPayloadNamespace)
+    : undefined;
   try {
     resolvedCall = await resolveToolCallPayload(
       authorized.call,
@@ -216,6 +222,7 @@ async function executeRuntimeToolCall(
             maxResultBytes: options.maxResultBytes,
             availableDescriptors: currentDescriptors,
             capabilityScope: createRuntimeCapabilityScope(context, authorized.call),
+            receiverWorkspaceRoot,
           },
         );
         providerCompleted = true;
@@ -231,6 +238,7 @@ async function executeRuntimeToolCall(
           maxResultBytes: options.maxResultBytes,
           availableDescriptors: currentDescriptors,
           capabilityScope: createRuntimeCapabilityScope(context, authorized.call),
+          receiverWorkspaceRoot,
         },
       );
       providerCompleted = true;

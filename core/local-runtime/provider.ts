@@ -7,15 +7,18 @@
  *
  * This provider is a `local` provider (in-process) whose `execute` is only
  * reached AFTER the runtime authorization path resolved the call. It never
- * authorizes anything itself. The `runtime.exec` tool forwards a `grant_id`
- * reference to the host; the host independently enforces (fail-closed) that a
- * non-empty background-issued grant reference is present and that the requested
- * profile is host-owned (`canary.echo` only) — the browser can never supply an
- * arbitrary command.
+ * authorizes anything itself. The `runtime.exec` tool forwards a
+ * background-derived `grant_id` correlation ticket and an optional
+ * background-owned `workspace_id` binding hint; both are model-invisible
+ * metadata, never authority. The sole execution authority is the background
+ * `capabilityScope`; the host only enforces that the requested profile is
+ * host-owned production `canary.echo` — the browser can never supply an
+ * arbitrary command or authorize execution with a non-empty string.
  */
 
 import type { JsonValue, ToolCall, ToolDescriptor, ToolResult } from '../tool/types';
 import type { ToolProviderExecutionContext } from '../tool/provider-registry';
+import { DEFAULT_LOCALE, translate, type SupportedLocale } from '../i18n/background';
 import {
   LOCAL_RUNTIME_CANARY_PROFILE,
   LOCAL_RUNTIME_HOST_ID,
@@ -33,15 +36,27 @@ export function localRuntimeProviderIdentity() {
   return LOCAL_RUNTIME_TOOL_PROVIDER;
 }
 
-export function createLocalRuntimeToolDescriptors(_locale: string): ToolDescriptor[] {
+export function createLocalRuntimeToolProviderIdentity(
+  locale: SupportedLocale = DEFAULT_LOCALE,
+) {
+  return {
+    ...LOCAL_RUNTIME_TOOL_PROVIDER,
+    displayName: translate(locale, 'tool.localRuntime.providerName'),
+  };
+}
+
+export function createLocalRuntimeToolDescriptors(
+  locale: SupportedLocale = DEFAULT_LOCALE,
+): ToolDescriptor[] {
+  const provider = createLocalRuntimeToolProviderIdentity(locale);
   return [
     {
       id: 'local-runtime.status',
-      provider: { ...LOCAL_RUNTIME_TOOL_PROVIDER },
+      provider: { ...provider },
       name: 'runtime.status',
       invocationName: 'runtime.status',
-      title: 'Local Runtime 状态',
-      description: '报告 Local Runtime 原生宿主（com.deepseek_pp.runtime.canary）的健康状态、平台、契约版本与可用执行画像。不会执行任何命令。',
+      title: translate(locale, 'tool.localRuntime.statusTitle'),
+      description: translate(locale, 'tool.localRuntime.statusDescription'),
       inputSchema: {
         type: 'object',
         properties: {},
@@ -57,18 +72,18 @@ export function createLocalRuntimeToolDescriptors(_locale: string): ToolDescript
     },
     {
       id: 'local-runtime.exec',
-      provider: { ...LOCAL_RUNTIME_TOOL_PROVIDER },
+      provider: { ...provider },
       name: 'runtime.exec',
       invocationName: 'runtime.exec',
-      title: '本地受限执行（canary）',
-      description: '在隔离的 Rust Local Runtime 宿主中以宿主拥有的 canary.echo 画像执行一次有界命令，返回输出、字节数与退出状态。仅允许宿主定义的非交互 echo 画像，浏览器无法提供任意命令。',
+      title: translate(locale, 'tool.localRuntime.execTitle'),
+      description: translate(locale, 'tool.localRuntime.execDescription'),
       inputSchema: {
         type: 'object',
         properties: {
           args: {
             type: 'array',
             items: { type: 'string' },
-            description: '传给 canary.echo 的参数（UTF-8 每项≤1024 字节，总请求≤64 KiB）。',
+            description: translate(locale, 'tool.localRuntime.argsDescription'),
           },
         },
         additionalProperties: false,
@@ -89,15 +104,20 @@ export async function executeLocalRuntimeToolCall(
   descriptor: ToolDescriptor,
   context?: ToolProviderExecutionContext,
 ): Promise<ToolResult> {
+  const locale = context?.locale ?? DEFAULT_LOCALE;
+  const provider = createLocalRuntimeToolProviderIdentity(locale);
   const startedAt = Date.now();
   try {
     if (descriptor.id === 'local-runtime.status') {
       const envelope = await localRuntimeStatus();
       return {
         ok: envelope.ok,
-        summary: `Local Runtime ${envelope.host.host_id} (${envelope.host.platform}) 正常`,
+        summary: translate(locale, 'tool.localRuntime.statusOk', {
+          hostId: envelope.host.host_id,
+          platform: envelope.host.platform,
+        }),
         descriptorId: descriptor.id,
-        provider: { ...LOCAL_RUNTIME_TOOL_PROVIDER },
+        provider: { ...provider },
         name: call.name,
         output: {
           host_id: envelope.host.host_id,
@@ -116,6 +136,8 @@ export async function executeLocalRuntimeToolCall(
     if (descriptor.id === 'local-runtime.exec') {
       // Authority is background-owned capabilityScope (grant/trusted), never payload.
       // Model/page-injected grant_id/profile_id/workspace_id/path are ignored.
+      // Receiver workspace comes only from context.receiverWorkspaceRoot
+      // (background authorization/receiver side), never from ToolCall.payload.
       const rawPayload = call.payload as Record<string, unknown> | undefined;
       const args = Array.isArray(rawPayload?.args)
         ? (rawPayload.args as unknown[]).filter((arg): arg is string => typeof arg === 'string')
@@ -125,9 +147,9 @@ export async function executeLocalRuntimeToolCall(
       if (!capabilityScope) {
         return {
           ok: false,
-          summary: '缺少后台授权（capabilityScope），宿主拒绝执行。',
+          summary: translate(locale, 'tool.localRuntime.authMissing'),
           descriptorId: descriptor.id,
-          provider: { ...LOCAL_RUNTIME_TOOL_PROVIDER },
+          provider: { ...provider },
           name: call.name,
           error: {
             code: 'runtime_authorization_missing',
@@ -141,13 +163,20 @@ export async function executeLocalRuntimeToolCall(
       }
 
       // Internal correlation ticket derived from receiver-owned scope — not model authority.
+      // The Rust host treats grant_id as audit/correlation metadata only and never
+      // gates execution on it; the background capabilityScope is the sole authority.
       const internalGrantId = `lr:${capabilityScope.scopeId}`;
       const profileId = LOCAL_RUNTIME_CANARY_PROFILE;
+      // Background-owned workspace binding; Rust still canonicalizes and fails closed.
+      const receiverWorkspace = context?.receiverWorkspaceRoot?.trim()
+        ? context.receiverWorkspaceRoot
+        : undefined;
 
       const envelope = await localRuntimeExec({
         grantId: internalGrantId,
         profileId,
         args,
+        workspaceId: receiverWorkspace,
         maxOutputBytes: 128_000,
         timeoutMs: 15_000,
       });
@@ -155,9 +184,11 @@ export async function executeLocalRuntimeToolCall(
       if (!envelope.ok) {
         return {
           ok: false,
-          summary: `本地执行被宿主拒绝：${envelope.error?.code ?? 'unknown'}`,
+          summary: translate(locale, 'tool.localRuntime.execRejected', {
+            code: envelope.error?.code ?? 'unknown',
+          }),
           descriptorId: descriptor.id,
-          provider: { ...LOCAL_RUNTIME_TOOL_PROVIDER },
+          provider: { ...provider },
           name: call.name,
           error: {
             code: envelope.error?.code ?? 'runtime_request_invalid',
@@ -174,9 +205,9 @@ export async function executeLocalRuntimeToolCall(
       if (!result) {
         return {
           ok: false,
-          summary: '宿主返回了成功标记但缺少执行结果',
+          summary: translate(locale, 'tool.localRuntime.missingResult'),
           descriptorId: descriptor.id,
-          provider: { ...LOCAL_RUNTIME_TOOL_PROVIDER },
+          provider: { ...provider },
           name: call.name,
           error: {
             code: 'local_runtime_unknown_error',
@@ -191,9 +222,11 @@ export async function executeLocalRuntimeToolCall(
 
       return {
         ok: true,
-        summary: `canary 执行完成，保留 ${result.bytes_retained} 字节`,
+        summary: translate(locale, 'tool.localRuntime.execComplete', {
+          bytes: result.bytes_retained,
+        }),
         descriptorId: descriptor.id,
-        provider: { ...LOCAL_RUNTIME_TOOL_PROVIDER },
+        provider: { ...provider },
         name: call.name,
         output: {
           run_id: result.run_id,
@@ -216,9 +249,9 @@ export async function executeLocalRuntimeToolCall(
 
     return {
       ok: false,
-      summary: '未知的 Local Runtime 工具',
+      summary: translate(locale, 'tool.localRuntime.unknownTool'),
       descriptorId: descriptor.id,
-      provider: { ...LOCAL_RUNTIME_TOOL_PROVIDER },
+      provider: { ...provider },
       name: call.name,
       error: { code: 'tool_unknown', message: 'Unknown Local Runtime tool.', retryable: false },
       startedAt,
@@ -229,9 +262,9 @@ export async function executeLocalRuntimeToolCall(
     const message = err instanceof Error ? err.message : String(err);
     return {
       ok: false,
-      summary: 'Local Runtime 调用失败',
+      summary: translate(locale, 'tool.localRuntime.callFailed'),
       descriptorId: descriptor.id,
-      provider: { ...LOCAL_RUNTIME_TOOL_PROVIDER },
+      provider: { ...provider },
       name: call.name,
       error: { code: 'local_runtime_unknown_error', message, retryable: true },
       startedAt,

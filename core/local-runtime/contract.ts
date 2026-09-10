@@ -42,8 +42,19 @@ export interface LocalRuntimeRequest {
   version: number;
   request_id: string;
   operation: LocalRuntimeOperation;
-  /** Internal correlation/metadata only — never model-visible authority. */
+  /**
+   * Background-owned internal correlation ticket only (P1C2).
+   * Never model-visible authority: the background authorization path is the
+   * sole execution authority. The Rust host treats this as audit metadata and
+   * never gates execution on its presence or value.
+   */
   grant_id?: string;
+  /**
+   * Background-owned internal workspace binding only (P1C2 receiver-owned).
+   * Never hydrated from `ToolCall.payload`. The Rust host still canonicalizes,
+   * verifies existence/directory, and fails closed; a browser/model-supplied
+   * path is never a trust fact.
+   */
   workspace_id?: string;
   profile_id?: string;
   timeout_ms?: number;
@@ -176,6 +187,37 @@ export function validateLocalRuntimeRequest(
     throw new LocalRuntimeContractError(
       'runtime_request_malformed',
       'unknown operation',
+    );
+  }
+
+  // P1C2: background-owned internal fields are strictly validated but never
+  // authorization evidence. grant_id is correlation-only (any string; the
+  // 64 KiB ceiling catches oversize). workspace_id is a background-owned
+  // binding hint: non-empty, bounded, no NUL; Rust still canonicalizes and
+  // fails closed. profile_id is host-enforced (production: canary.echo only).
+  if (request.grant_id !== undefined && typeof request.grant_id !== 'string') {
+    throw new LocalRuntimeContractError(
+      'runtime_request_malformed',
+      'grant_id must be a string when present',
+    );
+  }
+  if (request.workspace_id !== undefined) {
+    if (
+      typeof request.workspace_id !== 'string' ||
+      request.workspace_id.length === 0 ||
+      request.workspace_id.length > 4096 ||
+      request.workspace_id.includes('\0')
+    ) {
+      throw new LocalRuntimeContractError(
+        'runtime_request_invalid',
+        'workspace_id must be a non-empty string <= 4096 chars without NUL when present',
+      );
+    }
+  }
+  if (request.profile_id !== undefined && typeof request.profile_id !== 'string') {
+    throw new LocalRuntimeContractError(
+      'runtime_request_malformed',
+      'profile_id must be a string when present',
     );
   }
 

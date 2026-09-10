@@ -9,9 +9,12 @@
  * ceiling are owned solely by `core/native/request-channel.ts` — this module
  * only speaks the dedicated `deepseek-pp-local-runtime` operation contract.
  *
- * Authorization boundary: this client never authorizes execution. It only
- * carries a background-issued `grant_id` claim to the host, whose owner gate is
- * the actual authority.
+ * Authorization boundary (P1C2): this client never authorizes execution. It
+ * only carries background-owned internal correlation metadata (`grant_id`)
+ * and an optional background-owned workspace binding (`workspace_id`) to the
+ * host. Both are model-invisible and never authorization evidence; the
+ * background `capabilityScope` is the sole authority and the host only
+ * enforces the host-owned production profile allowlist.
  */
 
 import type {
