@@ -121,6 +121,13 @@ describe('Local Runtime tool provider', () => {
     const status = descriptors.find((d) => d.invocationName === 'runtime.status')!;
     expect(exec.execution.risk).toBe('high');
     expect(status.execution.risk).toBe('low');
-    expect(exec.inputSchema.required).toContain('grant_id');
+    // P1C1: model-visible schema must not expose authority claims
+    const props = exec.inputSchema.properties ?? {};
+    expect(props).not.toHaveProperty('grant_id');
+    expect(props).not.toHaveProperty('profile_id');
+    expect(props).not.toHaveProperty('workspace_id');
+    expect(exec.inputSchema.required ?? []).not.toContain('grant_id');
+    expect(exec.inputSchema.required ?? []).not.toContain('profile_id');
+    expect(props).toHaveProperty('args');
   });
 });
