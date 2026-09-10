@@ -20,7 +20,7 @@ execFileSync('git', ['rev-parse', '--is-inside-work-tree'], { cwd: root, stdio: 
 
 const status = execFileSync('git', ['status', '--porcelain'], { cwd: root, encoding: 'utf8' }).trim();
 if (status && process.env.CI === 'true') {
-  throw new Error('Source package requires a clean git tree in CI');
+  throw new Error(`Source package requires a clean git tree in CI (porcelain: ${JSON.stringify(status)})`);
 }
 if (status) {
   console.warn('Source package uses git archive HEAD; uncommitted changes are not included.');

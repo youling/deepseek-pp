@@ -138,6 +138,7 @@ for (const target of targets) {
 
 const background = readText('entrypoints/background.ts');
 const nativeTransport = readText('core/mcp/transports/native.ts');
+const nativeRequestChannel = readText('core/native/request-channel.ts');
 const browserControlConnection = readText('core/browser-control/cdp.ts');
 const browserControlService = readText('core/browser-control/service.ts');
 const syncIdentityPort = readText('core/sync/identity-port.ts');
@@ -147,7 +148,14 @@ const submission = readText('docs/chrome-web-store/submission.md');
 
 assertIncludes(background, 'chrome.alarms.create', 'alarms permission must create a Chrome alarm');
 assertIncludes(background, 'chrome.alarms.onAlarm.addListener', 'alarms permission must listen for alarm wakeups');
-assertIncludes(nativeTransport, 'chrome.runtime.connectNative', 'nativeMessaging permission must use connectNative');
+assertIncludes(nativeRequestChannel, 'connectNative', 'nativeMessaging permission must use connectNative');
+// P1A single-channel authority: Port lifecycle lives solely in
+// core/native/request-channel.ts; MCP/native clients delegate to it instead of
+// calling connectNative directly.
+assert(
+  nativeTransport.includes('requestNativeHost') || nativeTransport.includes('notifyNativeHost'),
+  'native MCP transport must delegate to the shared native request channel',
+);
 assertIncludes(background, 'chrome.contextMenus.create', 'contextMenus permission must create menu items');
 assertIncludes(background, 'chrome.contextMenus.onClicked.addListener', 'contextMenus permission must handle clicks');
 assertIncludes(background, 'chrome.offscreen.createDocument', 'offscreen permission must create an offscreen document');

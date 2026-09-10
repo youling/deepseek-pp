@@ -200,4 +200,3 @@ P1 acceptance criteria:
 - DeepSeek Harness MCP client: <https://github.com/deepseek-ai/deepseek-harness/tree/master/packages/mcp/mcp-client>
 - MCP Bridge reference: <https://github.com/scmypapa/mcp-bridge>
 - Serena reference: <https://github.com/oraios/serena>
-
