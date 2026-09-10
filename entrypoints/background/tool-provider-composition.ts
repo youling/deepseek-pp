@@ -127,7 +127,7 @@ export function createProductionToolProviderRegistry(): ToolProviderRegistry {
     createLocalProvider(
       LOCAL_RUNTIME_TOOL_PROVIDER.id,
       ({ locale }) => createLocalRuntimeToolDescriptors(locale),
-      (call, descriptor) => executeLocalRuntimeToolCall(call, descriptor),
+      (call, descriptor, context) => executeLocalRuntimeToolCall(call, descriptor, context),
     ),
     createMcpCapabilityProvider(),
     createMcpProvider(),

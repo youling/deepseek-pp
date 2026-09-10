@@ -42,6 +42,7 @@ export interface LocalRuntimeRequest {
   version: number;
   request_id: string;
   operation: LocalRuntimeOperation;
+  /** Internal correlation/metadata only — never model-visible authority. */
   grant_id?: string;
   workspace_id?: string;
   profile_id?: string;
@@ -122,11 +123,21 @@ export class LocalRuntimeContractError extends Error {
   }
 }
 
+function utf8ByteLength(value: string): number {
+  if (typeof TextEncoder !== 'undefined') {
+    return new TextEncoder().encode(value).length;
+  }
+  return new Blob([value]).size;
+}
+
 /**
  * Fail-closed validation mirroring `RuntimeRequest::validate()` on the Rust
  * host. `protocol`, `version`, and `operation` are authoritative; payload
  * claims (`grant_id`, `workspace_id`, `profile_id`, `args`) are never
  * authorization evidence by themselves — the host owner authorizes execution.
+ * Args are measured in UTF-8 bytes (not JS .length) and the serialized
+ * request must fit the 64 KiB runtime framing ceiling (outer 1 MiB channel
+ * guard does not replace it).
  */
 export function validateLocalRuntimeRequest(
   value: unknown,
@@ -177,7 +188,7 @@ export function validateLocalRuntimeRequest(
   }
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
-    if (typeof arg !== 'string' || (arg as string).length > LOCAL_RUNTIME_MAX_ARG_BYTES) {
+    if (typeof arg !== 'string' || utf8ByteLength(arg as string) > LOCAL_RUNTIME_MAX_ARG_BYTES) {
       throw new LocalRuntimeContractError(
         'runtime_request_invalid',
         `arg[${index}] exceeds ${LOCAL_RUNTIME_MAX_ARG_BYTES} bytes`,
@@ -204,6 +215,15 @@ export function validateLocalRuntimeRequest(
       );
     }
   }
+
+  // 64 KiB runtime framing ceiling (aligns with Rust framing.rs, not the outer 1 MiB channel).
+  const serializedBytes = new Blob([JSON.stringify(value)]).size;
+  if (serializedBytes > LOCAL_RUNTIME_MAX_REQUEST_BYTES) {
+    throw new LocalRuntimeContractError(
+      'runtime_request_invalid',
+      `serialized request exceeds ${LOCAL_RUNTIME_MAX_REQUEST_BYTES} bytes (${serializedBytes} bytes)`,
+    );
+  }
 }
 
 /** Build a well-formed, validated `runtime_status` request. */
@@ -218,7 +238,7 @@ export function buildLocalRuntimeStatusRequest(requestId: string): LocalRuntimeR
   return request;
 }
 
-/** Build a well-formed, validated `runtime_exec` request. */
+/** Build a well-formed, validated `runtime_exec` request (internal wire, not model-visible). */
 export function buildLocalRuntimeExecRequest(input: {
   requestId: string;
   grantId: string;
@@ -242,4 +262,164 @@ export function buildLocalRuntimeExecRequest(input: {
   };
   validateLocalRuntimeRequest(request);
   return request;
+}
+
+/**
+ * Strict, fail-closed validation for incoming Local Runtime envelopes.
+ * Must be called after shared-channel correlation and before any typed wrapper
+ * accepts the payload. Never use `as LocalRuntimeEnvelope` without this.
+ */
+export function validateLocalRuntimeEnvelope(
+  value: unknown,
+  expected?: { requestId?: string; operation?: LocalRuntimeResponseOperation },
+): asserts value is LocalRuntimeEnvelope {
+  if (typeof value !== 'object' || value === null) {
+    throw new LocalRuntimeContractError('runtime_request_malformed', 'envelope must be a JSON object');
+  }
+  const env = value as Record<string, unknown>;
+  if (env.protocol !== LOCAL_RUNTIME_PROTOCOL) {
+    throw new LocalRuntimeContractError('runtime_protocol_unknown', `unsupported protocol: ${String(env.protocol)}`);
+  }
+  if (env.version !== LOCAL_RUNTIME_VERSION) {
+    throw new LocalRuntimeContractError('runtime_version_unsupported', `unsupported contract version: ${String(env.version)}`);
+  }
+  if (typeof env.request_id !== 'string' || env.request_id.length === 0 || env.request_id.length > 128) {
+    throw new LocalRuntimeContractError('runtime_request_invalid', 'request_id must be a non-empty string <= 128 chars');
+  }
+  if (expected?.requestId !== undefined && env.request_id !== expected.requestId) {
+    throw new LocalRuntimeContractError('runtime_request_invalid', `request_id mismatch: expected ${expected.requestId}, got ${String(env.request_id)}`);
+  }
+  if (typeof env.operation !== 'string' || (env.operation !== 'runtime.status' && env.operation !== 'runtime.exec')) {
+    throw new LocalRuntimeContractError('runtime_request_malformed', `unknown response operation: ${String(env.operation)}`);
+  }
+  if (expected?.operation !== undefined && env.operation !== expected.operation) {
+    throw new LocalRuntimeContractError('runtime_request_invalid', `operation mismatch: expected ${expected.operation}, got ${String(env.operation)}`);
+  }
+  if (typeof env.ok !== 'boolean') {
+    throw new LocalRuntimeContractError('runtime_request_malformed', 'ok must be boolean');
+  }
+
+  if (env.operation === 'runtime.status') {
+    if (env.ok !== true) {
+      throw new LocalRuntimeContractError('runtime_request_invalid', 'runtime.status must have ok:true');
+    }
+    if (env.result !== undefined) {
+      throw new LocalRuntimeContractError('runtime_request_malformed', 'runtime.status must not have result');
+    }
+    if (env.error !== undefined) {
+      throw new LocalRuntimeContractError('runtime_request_malformed', 'runtime.status must not have error');
+    }
+    validateLocalRuntimeHostInfo(env.host);
+    return;
+  }
+
+  // operation === 'runtime.exec'
+  if (env.host !== undefined) {
+    throw new LocalRuntimeContractError('runtime_request_malformed', 'runtime.exec must not have host');
+  }
+  const hasResult = env.result !== undefined;
+  const hasError = env.error !== undefined;
+  if (env.ok === true) {
+    if (!hasResult || hasError) {
+      throw new LocalRuntimeContractError('runtime_request_malformed', 'runtime.exec ok:true must have exactly result');
+    }
+    validateLocalRuntimeExecResult(env.result);
+    return;
+  }
+  // ok === false
+  if (!hasError || hasResult) {
+    throw new LocalRuntimeContractError('runtime_request_malformed', 'runtime.exec ok:false must have exactly error');
+  }
+  validateLocalRuntimeError(env.error);
+}
+
+function validateLocalRuntimeHostInfo(value: unknown): asserts value is LocalRuntimeHostInfo {
+  if (typeof value !== 'object' || value === null) {
+    throw new LocalRuntimeContractError('runtime_request_malformed', 'host must be an object');
+  }
+  const host = value as Record<string, unknown>;
+  if (typeof host.host_id !== 'string' || host.host_id.length === 0) {
+    throw new LocalRuntimeContractError('runtime_request_malformed', 'host.host_id must be non-empty string');
+  }
+  if (host.host_id !== LOCAL_RUNTIME_HOST_ID) {
+    throw new LocalRuntimeContractError('runtime_request_invalid', `host_id must be ${LOCAL_RUNTIME_HOST_ID}`);
+  }
+  if (typeof host.runtime_version !== 'string' || host.runtime_version.length === 0) {
+    throw new LocalRuntimeContractError('runtime_request_malformed', 'host.runtime_version must be non-empty string');
+  }
+  if (host.contract_version !== LOCAL_RUNTIME_VERSION) {
+    throw new LocalRuntimeContractError('runtime_version_unsupported', `host contract_version must be ${LOCAL_RUNTIME_VERSION}`);
+  }
+  if (typeof host.platform !== 'string' || host.platform.length === 0) {
+    throw new LocalRuntimeContractError('runtime_request_malformed', 'host.platform must be non-empty string');
+  }
+  if (typeof host.pty_supported !== 'boolean') {
+    throw new LocalRuntimeContractError('runtime_request_malformed', 'host.pty_supported must be boolean');
+  }
+  if (!Array.isArray(host.profiles) || host.profiles.length === 0) {
+    throw new LocalRuntimeContractError('runtime_request_malformed', 'host.profiles must be non-empty array');
+  }
+  for (const p of host.profiles) {
+    if (typeof p !== 'string' || p.length === 0) {
+      throw new LocalRuntimeContractError('runtime_request_malformed', 'host.profiles entries must be non-empty strings');
+    }
+  }
+}
+
+function validateLocalRuntimeExecResult(value: unknown): asserts value is LocalRuntimeExecResult {
+  if (typeof value !== 'object' || value === null) {
+    throw new LocalRuntimeContractError('runtime_request_malformed', 'result must be an object');
+  }
+  const result = value as Record<string, unknown>;
+  if (typeof result.run_id !== 'string' || result.run_id.length === 0) {
+    throw new LocalRuntimeContractError('runtime_request_malformed', 'result.run_id must be non-empty string');
+  }
+  const exit = result.exit_status;
+  if (typeof exit !== 'object' || exit === null) {
+    throw new LocalRuntimeContractError('runtime_request_malformed', 'result.exit_status must be an object');
+  }
+  const exitRec = exit as Record<string, unknown>;
+  const code = exitRec.code;
+  const signal = exitRec.signal;
+  if (!(code === null || (typeof code === 'number' && Number.isInteger(code)))) {
+    throw new LocalRuntimeContractError('runtime_request_malformed', 'result.exit_status.code must be integer or null');
+  }
+  if (!(signal === null || typeof signal === 'string')) {
+    throw new LocalRuntimeContractError('runtime_request_malformed', 'result.exit_status.signal must be string or null');
+  }
+  for (const key of ['timed_out', 'cancelled', 'teardown_confirmed', 'more_available'] as const) {
+    if (typeof result[key] !== 'boolean') {
+      throw new LocalRuntimeContractError('runtime_request_malformed', `result.${key} must be boolean`);
+    }
+  }
+  for (const key of ['bytes_seen', 'bytes_retained'] as const) {
+    const v = result[key];
+    if (typeof v !== 'number' || !Number.isInteger(v) || v < 0) {
+      throw new LocalRuntimeContractError('runtime_request_malformed', `result.${key} must be non-negative integer`);
+    }
+  }
+  const bytesSeen = result.bytes_seen as number;
+  const bytesRetained = result.bytes_retained as number;
+  if (bytesRetained > bytesSeen) {
+    throw new LocalRuntimeContractError('runtime_request_invalid', 'bytes_retained must not exceed bytes_seen');
+  }
+  if (typeof result.output !== 'string') {
+    throw new LocalRuntimeContractError('runtime_request_malformed', 'result.output must be string');
+  }
+}
+
+function validateLocalRuntimeError(value: unknown): asserts value is LocalRuntimeError {
+  if (typeof value !== 'object' || value === null) {
+    throw new LocalRuntimeContractError('runtime_request_malformed', 'error must be an object');
+  }
+  const err = value as Record<string, unknown>;
+  if (typeof err.code !== 'string' || err.code.length === 0) {
+    throw new LocalRuntimeContractError('runtime_request_malformed', 'error.code must be non-empty string');
+  }
+  if (typeof err.message !== 'string' || err.message.length === 0) {
+    throw new LocalRuntimeContractError('runtime_request_malformed', 'error.message must be non-empty string');
+  }
+  if (err.retryable !== undefined && typeof err.retryable !== 'boolean') {
+    throw new LocalRuntimeContractError('runtime_request_malformed', 'error.retryable must be boolean if present');
+  }
 }
