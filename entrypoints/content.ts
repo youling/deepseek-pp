@@ -6704,7 +6704,11 @@ async function persistToolBlockSession(
     "tool execution block write",
     upsertPersistedToolExecutionBlock(block),
   );
-  if (toolCapabilityScope?.active && session.responseCommitted) {
+  if (
+    toolCapabilityScope?.active &&
+    session.responseCommitted &&
+    !isRuntimeCanaryToolBlockSession(session)
+  ) {
     restoredToolRecords.set(block.id, block);
     pendingRestoredToolRecordIds.add(block.id);
     scheduleRenderRestoredToolBlocks();
@@ -6720,7 +6724,11 @@ async function restorePersistedToolBlocks(
   if (!isToolEpochActive(scope, epoch)) return;
   rememberRestoredToolRecords(
     blocks
-      .filter((block) => shouldTryRestoreToolBlock(block, url))
+      .filter(
+        (block) =>
+          !isRuntimeCanaryPersistedToolBlock(block) &&
+          shouldTryRestoreToolBlock(block, url),
+      )
       .map((block) => ({ ...block, source: "storage" as const })),
   );
 }
@@ -7691,6 +7699,18 @@ function isAnyActiveToolBlockSessionUncommitted(): boolean {
   return false;
 }
 
+function isRuntimeCanaryToolExecution(execution: ToolExecutionRecord): boolean {
+  return execution.name === "runtime.exec" || execution.name === "runtime.status";
+}
+
+function isRuntimeCanaryToolBlockSession(session: ActiveToolBlockSession): boolean {
+  return session.executions.some(isRuntimeCanaryToolExecution);
+}
+
+function isRuntimeCanaryPersistedToolBlock(block: PersistedToolBlock): boolean {
+  return (block.executions ?? []).some(isRuntimeCanaryToolExecution);
+}
+
 function renderToolBlock(
   session: ActiveToolBlockSession = getActiveToolBlockSession() ?? {
     id: "",
@@ -7708,6 +7728,10 @@ function renderToolBlock(
 ) {
   if (session.executions.length === 0) return;
   if (!isToolBlockSessionOnCurrentRoute(session)) return;
+  // P1 runtime canary presentation is intentionally DOM-isolated. The canary
+  // proves execution + same-session continuation; it never owns DeepSeek's
+  // React-managed assistant-message subtree.
+  if (isRuntimeCanaryToolBlockSession(session)) return;
   // Live-stream guard: never mutate DeepSeek-owned response DOM while the
   // native response is still uncommitted. Presentation is deferred until
   // RESPONSE_COMPLETE commits the session.

@@ -83,11 +83,15 @@ describe('P1 Web tool-stream React DOM race (P1-web-tool-stream-react-dom-race-r
     const persistStart = contentSource.indexOf('async function persistToolBlockSession');
     const persistEnd = contentSource.indexOf('async function restorePersistedToolBlocks', persistStart);
     const persistSource = contentSource.slice(persistStart, persistEnd);
-    expect(persistSource).toContain('toolCapabilityScope?.active && session.responseCommitted');
-    const gateIndex = persistSource.indexOf('toolCapabilityScope?.active && session.responseCommitted');
-    const scheduleIndex = persistSource.indexOf('scheduleRenderRestoredToolBlocks()', gateIndex);
-    expect(gateIndex).toBeGreaterThan(-1);
-    expect(scheduleIndex).toBeGreaterThan(gateIndex);
+    expect(persistSource).toMatch(/toolCapabilityScope\?\.active\s*&&\s*session\.responseCommitted/);
+    const activeIndex = persistSource.indexOf('toolCapabilityScope?.active');
+    const commitIndex = persistSource.indexOf('session.responseCommitted', activeIndex);
+    const canaryIsolationIndex = persistSource.indexOf('!isRuntimeCanaryToolBlockSession(session)', commitIndex);
+    const scheduleIndex = persistSource.indexOf('scheduleRenderRestoredToolBlocks()', canaryIsolationIndex);
+    expect(activeIndex).toBeGreaterThan(-1);
+    expect(commitIndex).toBeGreaterThan(activeIndex);
+    expect(canaryIsolationIndex).toBeGreaterThan(commitIndex);
+    expect(scheduleIndex).toBeGreaterThan(canaryIsolationIndex);
   });
 
   describe('DOM-level race', () => {
