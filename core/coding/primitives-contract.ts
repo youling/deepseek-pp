@@ -7,8 +7,8 @@ import {
 /**
  * P2 PREP / NON-EXECUTABLE.
  *
- * This file freezes the coding contract only. It must not register a provider,
- * invoke Native Messaging, execute a process, or touch the filesystem.
+ * This module freezes the coding contract only. It contains no provider
+ * registration, Native Messaging hookup, process execution, or filesystem I/O.
  */
 export const CODING_CONTRACT_VERSION = 1 as const;
 export type CodingContractVersion = typeof CODING_CONTRACT_VERSION;
@@ -30,14 +30,14 @@ export const CODING_PRIMITIVE_NAMES = [
 
 export type CodingPrimitiveName = typeof CODING_PRIMITIVE_NAMES[number];
 
-/**
- * Direct file mutation is intentionally a single-authority surface:
- * `coding_apply_patch`. Process control is separate; controlled git mutation,
- * if later permitted by the existing authorization path, goes through
- * `coding_process_exec` rather than new git-mutation primitives.
- */
 export type CodingPrimitiveEffect = 'read-only' | 'file-mutation' | 'process-control';
 
+/**
+ * `coding_apply_patch` is the only direct file-mutation primitive. Git mutation
+ * is intentionally not represented by a dedicated v0 primitive; any future
+ * mutation through `coding_process_exec` remains subject to the existing
+ * receiver-owned authorization/risk path.
+ */
 export const CODING_PRIMITIVE_EFFECTS: Readonly<Record<CodingPrimitiveName, CodingPrimitiveEffect>> = {
   coding_workspace_info: 'read-only',
   coding_file_read: 'read-only',
@@ -54,12 +54,20 @@ export const CODING_PRIMITIVE_EFFECTS: Readonly<Record<CodingPrimitiveName, Codi
 };
 
 export const CODING_CONTRACT_ERROR_CODES = [
+  'P2_UNKNOWN_PRIMITIVE',
   'P2_INVALID_OBJECT',
   'P2_UNSUPPORTED_VERSION',
   'P2_UNKNOWN_FIELD',
   'P2_MISSING_FIELD',
   'P2_INVALID_FIELD',
   'P2_MODEL_WORKSPACE_ROOT_FORBIDDEN',
+  'P2_MODEL_CAPABILITY_FORBIDDEN',
+  'P2_PROJECT_ROOT_REQUIRED',
+  'P2_INVALID_CANONICAL_ROOT',
+  'P2_DUPLICATE_REPO_ROOT_IDENTITY',
+  'P2_INVALID_CANONICAL_REFERENCE',
+  'P2_REFERENCE_OUTSIDE_DECLARED_WORKTREE',
+  'P2_AUXILIARY_REPO_NOT_DECLARED',
   'P2_ABSOLUTE_PATH_FORBIDDEN',
   'P2_PATH_ESCAPE_FORBIDDEN',
 ] as const;
@@ -71,6 +79,7 @@ export const CODING_RUNTIME_ERROR_CODES = [
   'P2_RUNTIME_UNAVAILABLE',
   'P2_IO_ERROR',
   'P2_PROTOCOL_ERROR',
+  'P2_ADAPTER_HARD_ERROR',
 ] as const;
 
 export type CodingContractErrorCode = typeof CODING_CONTRACT_ERROR_CODES[number];
@@ -108,20 +117,30 @@ function fail(
   };
 }
 
+const CODING_PRIMITIVE_NAME_SET = new Set<string>(CODING_PRIMITIVE_NAMES);
+
+/** Runtime membership guard for primitive names arriving from raw JSON/unknown. */
+export function validateCodingPrimitiveName(value: unknown): CodingContractResult<CodingPrimitiveName> {
+  if (typeof value !== 'string' || !CODING_PRIMITIVE_NAME_SET.has(value)) {
+    return fail('P2_UNKNOWN_PRIMITIVE', 'unknown or future coding primitive is not accepted');
+  }
+  return pass(value as CodingPrimitiveName);
+}
+
 declare const workspaceRelativePathBrand: unique symbol;
 export type WorkspaceRelativePath = string & {
   readonly [workspaceRelativePathBrand]: true;
 };
 
 /**
- * All model-visible paths express workspace-relative intent only. The trusted
- * P1/P2 adapter remains responsible for realpath/symlink containment before
- * execution; a model-supplied workspace root is never accepted as authority.
+ * Model/page paths express workspace-relative intent only. Absolute POSIX,
+ * drive-qualified/UNC Windows paths, NUL, and parent traversal fail closed.
+ * Canonical realpath/symlink containment belongs to the trusted adapter seam.
  */
 export function validateWorkspaceRelativePath(
-  input: string,
+  input: unknown,
 ): CodingContractResult<WorkspaceRelativePath> {
-  if (!input || input.includes('\0')) {
+  if (typeof input !== 'string' || !input || input.includes('\0')) {
     return fail('P2_INVALID_FIELD', 'workspace-relative path must be a non-empty string without NUL');
   }
 
@@ -129,7 +148,7 @@ export function validateWorkspaceRelativePath(
   if (normalizedSeparators.startsWith('/') || /^[A-Za-z]:/.test(normalizedSeparators)) {
     return fail(
       'P2_ABSOLUTE_PATH_FORBIDDEN',
-      'absolute or drive-qualified paths are forbidden; use workspace-relative intent',
+      'absolute, UNC, or drive-qualified paths are forbidden; use workspace-relative intent',
     );
   }
 
@@ -145,6 +164,164 @@ export function validateWorkspaceRelativePath(
   return pass(normalized as WorkspaceRelativePath);
 }
 
+/** Backward-compatible name for the same validated workspace-relative identity. */
+export type RepoRelativeIdentity = WorkspaceRelativePath;
+export const validateRepoRelativeIdentity = validateWorkspaceRelativePath;
+
+/** Receiver/trusted-adapter-owned canonical root. Never accepted from model input. */
+export interface CanonicalRepoRoot {
+  identity: string;
+  canonicalPath: string;
+}
+
+export interface DeclaredCodingWorkspace {
+  projectRoot: CanonicalRepoRoot;
+  auxiliaryRepoRoots: readonly CanonicalRepoRoot[];
+}
+
+function validateCanonicalRoot(
+  root: CanonicalRepoRoot,
+  label: 'project' | 'auxiliary',
+): CodingContractResult<CanonicalRepoRoot> {
+  if (!root.identity.trim() || !root.canonicalPath.trim()) {
+    return fail(
+      'P2_INVALID_CANONICAL_ROOT',
+      `${label} repo root requires non-empty trusted identity and canonicalPath`,
+    );
+  }
+  return pass(root);
+}
+
+/** Trusted-only workspace declaration seam; no model/page field can populate it. */
+export function requireExplicitProjectRoot(
+  root: CanonicalRepoRoot | null | undefined,
+): CodingContractResult<CanonicalRepoRoot> {
+  if (!root) {
+    return fail('P2_PROJECT_ROOT_REQUIRED', 'trusted adapter must provide an explicit project root');
+  }
+  return validateCanonicalRoot(root, 'project');
+}
+
+/**
+ * Build the receiver-owned workspace boundary from a project root and exact
+ * auxiliary-repository allowlist. This is trusted context, not primitive input.
+ */
+export function declareCodingWorkspace(input: {
+  projectRoot: CanonicalRepoRoot | null | undefined;
+  auxiliaryRepoRoots?: readonly CanonicalRepoRoot[];
+}): CodingContractResult<DeclaredCodingWorkspace> {
+  const project = requireExplicitProjectRoot(input.projectRoot);
+  if (!project.ok) return project;
+
+  const auxiliaryRepoRoots = input.auxiliaryRepoRoots ?? [];
+  const seenIdentities = new Set<string>([project.value.identity]);
+  const seenCanonicalPaths = new Set<string>([project.value.canonicalPath]);
+
+  for (const root of auxiliaryRepoRoots) {
+    const validated = validateCanonicalRoot(root, 'auxiliary');
+    if (!validated.ok) return validated;
+    if (seenIdentities.has(root.identity) || seenCanonicalPaths.has(root.canonicalPath)) {
+      return fail(
+        'P2_DUPLICATE_REPO_ROOT_IDENTITY',
+        'project and auxiliary roots must have unique canonical identities and paths',
+        { rootIdentity: root.identity },
+      );
+    }
+    seenIdentities.add(root.identity);
+    seenCanonicalPaths.add(root.canonicalPath);
+  }
+
+  return pass({
+    projectRoot: project.value,
+    auxiliaryRepoRoots: [...auxiliaryRepoRoots],
+  });
+}
+
+export type CodingReferenceKind = 'path' | 'repo-ref';
+export type CodingRepoRootRole = 'project' | 'auxiliary';
+
+/** Candidate produced by the future trusted canonicalization adapter. */
+export interface CanonicalCodingReferenceCandidate {
+  kind: CodingReferenceKind;
+  requested: string;
+  canonicalPath: string;
+  rootIdentity: string;
+  rootRole: CodingRepoRootRole;
+  repoRelativeIdentity: string;
+}
+
+export interface ValidatedCodingReference extends Omit<
+  CanonicalCodingReferenceCandidate,
+  'repoRelativeIdentity'
+> {
+  repoRelativeIdentity: WorkspaceRelativePath;
+}
+
+export interface CodingReferenceResolutionRequest {
+  requested: string;
+  kind: CodingReferenceKind;
+  cwd: WorkspaceRelativePath;
+  workspace: DeclaredCodingWorkspace;
+}
+
+export type CodingReferenceResolutionResult =
+  | { ok: true; reference: CanonicalCodingReferenceCandidate }
+  | { ok: false; adapterCode: string; message: string; retryable?: boolean };
+
+/** Typed seam only; P2 PREP supplies no implementation. */
+export interface CodingCanonicalizationAdapter {
+  readonly adapterId: string;
+  resolveReference(request: CodingReferenceResolutionRequest): Promise<CodingReferenceResolutionResult>;
+}
+
+function findDeclaredRoot(
+  workspace: DeclaredCodingWorkspace,
+  identity: string,
+): { role: CodingRepoRootRole; root: CanonicalRepoRoot } | undefined {
+  if (workspace.projectRoot.identity === identity) {
+    return { role: 'project', root: workspace.projectRoot };
+  }
+  const auxiliary = workspace.auxiliaryRepoRoots.find((root) => root.identity === identity);
+  return auxiliary ? { role: 'auxiliary', root: auxiliary } : undefined;
+}
+
+/**
+ * Re-check trusted canonicalization output against the receiver-owned declared
+ * worktree boundary before any future executor seam.
+ */
+export function validateCanonicalReference(
+  workspace: DeclaredCodingWorkspace,
+  candidate: CanonicalCodingReferenceCandidate,
+): CodingContractResult<ValidatedCodingReference> {
+  if (!candidate.canonicalPath.trim() || !candidate.rootIdentity.trim()) {
+    return fail('P2_INVALID_CANONICAL_REFERENCE', 'canonical reference metadata is incomplete');
+  }
+
+  const declared = findDeclaredRoot(workspace, candidate.rootIdentity);
+  if (!declared) {
+    return fail(
+      candidate.rootRole === 'auxiliary'
+        ? 'P2_AUXILIARY_REPO_NOT_DECLARED'
+        : 'P2_REFERENCE_OUTSIDE_DECLARED_WORKTREE',
+      'canonical reference is not contained by a declared repo root',
+      { rootIdentity: candidate.rootIdentity },
+    );
+  }
+
+  if (declared.role !== candidate.rootRole) {
+    return fail(
+      'P2_INVALID_CANONICAL_REFERENCE',
+      'canonical reference root role does not match the declared workspace root',
+      { rootIdentity: candidate.rootIdentity },
+    );
+  }
+
+  const relative = validateWorkspaceRelativePath(candidate.repoRelativeIdentity);
+  if (!relative.ok) return relative;
+
+  return pass({ ...candidate, repoRelativeIdentity: relative.value });
+}
+
 export interface CodingWorkspaceInfoInput {
   version: CodingContractVersion;
 }
@@ -152,12 +329,12 @@ export interface CodingWorkspaceInfoInput {
 export interface CodingWorkspaceInfoOutput {
   version: CodingContractVersion;
   workspaceId: string;
-  cwd: string;
+  cwd: WorkspaceRelativePath;
 }
 
 export interface CodingFileReadInput {
   version: CodingContractVersion;
-  path: string;
+  path: WorkspaceRelativePath;
   maxBytes?: number;
 }
 
@@ -170,25 +347,25 @@ export interface CodingBoundedText {
 
 export interface CodingFileReadOutput {
   version: CodingContractVersion;
-  path: string;
+  path: WorkspaceRelativePath;
   content: CodingBoundedText;
 }
 
 export interface CodingFileListInput {
   version: CodingContractVersion;
-  path?: string;
+  path?: WorkspaceRelativePath;
   recursive?: boolean;
   maxEntries?: number;
 }
 
 export interface CodingFileListEntry {
-  path: string;
+  path: WorkspaceRelativePath;
   kind: 'file' | 'directory' | 'symlink' | 'other';
 }
 
 export interface CodingFileListOutput {
   version: CodingContractVersion;
-  path: string;
+  path: WorkspaceRelativePath;
   entries: readonly CodingFileListEntry[];
   totalEntries: number;
   retainedEntries: number;
@@ -198,12 +375,12 @@ export interface CodingFileListOutput {
 export interface CodingFileSearchInput {
   version: CodingContractVersion;
   query: string;
-  path?: string;
+  path?: WorkspaceRelativePath;
   maxMatches?: number;
 }
 
 export interface CodingFileSearchMatch {
-  path: string;
+  path: WorkspaceRelativePath;
   line?: number;
   text: string;
 }
@@ -218,8 +395,8 @@ export interface CodingFileSearchOutput {
 }
 
 export interface CodingPatchFile {
-  /** Structured authority path; patch text must not override this path. */
-  path: string;
+  /** Structured authority path; patch text itself must never redefine this path. */
+  path: WorkspaceRelativePath;
   patch: string;
 }
 
@@ -230,7 +407,7 @@ export interface CodingApplyPatchInput {
 
 export interface CodingApplyPatchOutput {
   version: CodingContractVersion;
-  changedPaths: readonly string[];
+  changedPaths: readonly WorkspaceRelativePath[];
 }
 
 export interface CodingProcessExecInput {
@@ -238,7 +415,7 @@ export interface CodingProcessExecInput {
   requestId: string;
   executable: string;
   args?: readonly string[];
-  cwd?: string;
+  cwd?: WorkspaceRelativePath;
   timeoutMs?: number;
 }
 
@@ -266,12 +443,11 @@ export interface CodingProcessKillInput {
 }
 
 /**
- * Lifecycle fields are explicit rather than inferred from a missing exit code.
- * `teardownConfirmed` is independent from cancel/timeout so cleanup cannot be
- * reported complete merely because cancellation was requested.
+ * Process lifecycle is explicit. An exited process carries an exit status;
+ * cancellation/timeout and teardown confirmation are independent facts.
  */
 export interface CodingProcessLifecycle {
-  state: 'running' | 'exited' | 'failed';
+  state: 'running' | 'exited';
   exitCode: number | null;
   exitSignal: string | null;
   timedOut: boolean;
@@ -279,11 +455,13 @@ export interface CodingProcessLifecycle {
   teardownConfirmed: boolean;
 }
 
+/** Bounded retained stream plus deterministic continuation offset. */
 export interface CodingProcessStream {
   data: string;
   bytesSeen: number;
   bytesRetained: number;
   moreAvailable: boolean;
+  nextOffset: number;
 }
 
 export const CODING_PROCESS_LIFECYCLE_FIELDS = [
@@ -300,6 +478,7 @@ export const CODING_PROCESS_STREAM_FIELDS = [
   'bytesSeen',
   'bytesRetained',
   'moreAvailable',
+  'nextOffset',
 ] as const;
 
 export interface CodingProcessSnapshotOutput {
@@ -314,38 +493,30 @@ export interface CodingProcessSnapshotOutput {
 export type CodingProcessExecOutput = CodingProcessSnapshotOutput;
 export type CodingProcessReadOutput = CodingProcessSnapshotOutput;
 
-export interface CodingProcessWriteOutput {
-  version: CodingContractVersion;
-  requestId: string;
-  runId: string;
+export interface CodingProcessWriteOutput extends CodingProcessSnapshotOutput {
   acceptedBytes: number;
   stdinClosed: boolean;
-  lifecycle: CodingProcessLifecycle;
 }
 
-export interface CodingProcessKillOutput {
-  version: CodingContractVersion;
-  requestId: string;
-  runId: string;
+export interface CodingProcessKillOutput extends CodingProcessSnapshotOutput {
   cancelRequested: boolean;
-  lifecycle: CodingProcessLifecycle;
 }
 
 export interface CodingGitStatusInput {
   version: CodingContractVersion;
-  cwd?: string;
+  cwd?: WorkspaceRelativePath;
 }
 
 export interface CodingGitDiffInput {
   version: CodingContractVersion;
-  cwd?: string;
+  cwd?: WorkspaceRelativePath;
   staged?: boolean;
-  paths?: readonly string[];
+  paths?: readonly WorkspaceRelativePath[];
 }
 
 export interface CodingGitLogInput {
   version: CodingContractVersion;
-  cwd?: string;
+  cwd?: WorkspaceRelativePath;
   ref?: string;
   maxEntries?: number;
 }
@@ -392,14 +563,20 @@ export interface CodingPrimitiveOutputMap {
 export type CodingFieldKind =
   | 'version'
   | 'string'
+  | 'nonEmptyString'
   | 'boolean'
   | 'nonNegativeInteger'
+  | 'nullableExitCode'
+  | 'nullableString'
   | 'stringArray'
   | 'workspacePath'
   | 'workspacePathArray'
   | 'patchFiles'
-  | 'object'
-  | 'array';
+  | 'boundedText'
+  | 'fileListEntries'
+  | 'fileSearchMatches'
+  | 'processLifecycle'
+  | 'processStream';
 
 export interface CodingFieldSchema {
   kind: CodingFieldKind;
@@ -424,30 +601,27 @@ const strict = (fields: Record<string, CodingFieldSchema>): CodingObjectSchema =
   additionalProperties: false,
 });
 
-/**
- * Non-registered schema catalog. It is contract data only, not a second tool
- * registry and intentionally contains no grant/token/authorization evidence.
- */
+/** Contract catalog only; this is not a production tool/provider registry. */
 export const CODING_PRIMITIVE_SCHEMAS: Readonly<Record<CodingPrimitiveName, CodingPrimitiveSchema>> = {
   coding_workspace_info: {
     effect: 'read-only',
     input: strict({ version: req('version') }),
-    output: strict({ version: req('version'), workspaceId: req('string'), cwd: req('workspacePath') }),
+    output: strict({ version: req('version'), workspaceId: req('nonEmptyString'), cwd: req('workspacePath') }),
   },
   coding_file_read: {
     effect: 'read-only',
     input: strict({ version: req('version'), path: req('workspacePath'), maxBytes: opt('nonNegativeInteger') }),
-    output: strict({ version: req('version'), path: req('workspacePath'), content: req('object') }),
+    output: strict({ version: req('version'), path: req('workspacePath'), content: req('boundedText') }),
   },
   coding_file_list: {
     effect: 'read-only',
     input: strict({ version: req('version'), path: opt('workspacePath'), recursive: opt('boolean'), maxEntries: opt('nonNegativeInteger') }),
-    output: strict({ version: req('version'), path: req('workspacePath'), entries: req('array'), totalEntries: req('nonNegativeInteger'), retainedEntries: req('nonNegativeInteger'), moreAvailable: req('boolean') }),
+    output: strict({ version: req('version'), path: req('workspacePath'), entries: req('fileListEntries'), totalEntries: req('nonNegativeInteger'), retainedEntries: req('nonNegativeInteger'), moreAvailable: req('boolean') }),
   },
   coding_file_search: {
     effect: 'read-only',
     input: strict({ version: req('version'), query: req('string'), path: opt('workspacePath'), maxMatches: opt('nonNegativeInteger') }),
-    output: strict({ version: req('version'), query: req('string'), matches: req('array'), totalMatches: req('nonNegativeInteger'), retainedMatches: req('nonNegativeInteger'), moreAvailable: req('boolean') }),
+    output: strict({ version: req('version'), query: req('string'), matches: req('fileSearchMatches'), totalMatches: req('nonNegativeInteger'), retainedMatches: req('nonNegativeInteger'), moreAvailable: req('boolean') }),
   },
   coding_apply_patch: {
     effect: 'file-mutation',
@@ -456,59 +630,97 @@ export const CODING_PRIMITIVE_SCHEMAS: Readonly<Record<CodingPrimitiveName, Codi
   },
   coding_process_exec: {
     effect: 'process-control',
-    input: strict({ version: req('version'), requestId: req('string'), executable: req('string'), args: opt('stringArray'), cwd: opt('workspacePath'), timeoutMs: opt('nonNegativeInteger') }),
-    output: strict({ version: req('version'), requestId: req('string'), runId: req('string'), lifecycle: req('object'), stdout: req('object'), stderr: req('object') }),
+    input: strict({ version: req('version'), requestId: req('nonEmptyString'), executable: req('nonEmptyString'), args: opt('stringArray'), cwd: opt('workspacePath'), timeoutMs: opt('nonNegativeInteger') }),
+    output: strict({ version: req('version'), requestId: req('nonEmptyString'), runId: req('nonEmptyString'), lifecycle: req('processLifecycle'), stdout: req('processStream'), stderr: req('processStream') }),
   },
   coding_process_read: {
     effect: 'read-only',
-    input: strict({ version: req('version'), requestId: req('string'), runId: req('string'), stdoutOffset: opt('nonNegativeInteger'), stderrOffset: opt('nonNegativeInteger'), maxBytes: opt('nonNegativeInteger') }),
-    output: strict({ version: req('version'), requestId: req('string'), runId: req('string'), lifecycle: req('object'), stdout: req('object'), stderr: req('object') }),
+    input: strict({ version: req('version'), requestId: req('nonEmptyString'), runId: req('nonEmptyString'), stdoutOffset: opt('nonNegativeInteger'), stderrOffset: opt('nonNegativeInteger'), maxBytes: opt('nonNegativeInteger') }),
+    output: strict({ version: req('version'), requestId: req('nonEmptyString'), runId: req('nonEmptyString'), lifecycle: req('processLifecycle'), stdout: req('processStream'), stderr: req('processStream') }),
   },
   coding_process_write: {
     effect: 'process-control',
-    input: strict({ version: req('version'), requestId: req('string'), runId: req('string'), data: req('string'), closeStdin: opt('boolean') }),
-    output: strict({ version: req('version'), requestId: req('string'), runId: req('string'), acceptedBytes: req('nonNegativeInteger'), stdinClosed: req('boolean'), lifecycle: req('object') }),
+    input: strict({ version: req('version'), requestId: req('nonEmptyString'), runId: req('nonEmptyString'), data: req('string'), closeStdin: opt('boolean') }),
+    output: strict({ version: req('version'), requestId: req('nonEmptyString'), runId: req('nonEmptyString'), lifecycle: req('processLifecycle'), stdout: req('processStream'), stderr: req('processStream'), acceptedBytes: req('nonNegativeInteger'), stdinClosed: req('boolean') }),
   },
   coding_process_kill: {
     effect: 'process-control',
-    input: strict({ version: req('version'), requestId: req('string'), runId: req('string') }),
-    output: strict({ version: req('version'), requestId: req('string'), runId: req('string'), cancelRequested: req('boolean'), lifecycle: req('object') }),
+    input: strict({ version: req('version'), requestId: req('nonEmptyString'), runId: req('nonEmptyString') }),
+    output: strict({ version: req('version'), requestId: req('nonEmptyString'), runId: req('nonEmptyString'), lifecycle: req('processLifecycle'), stdout: req('processStream'), stderr: req('processStream'), cancelRequested: req('boolean') }),
   },
   coding_git_status: {
     effect: 'read-only',
     input: strict({ version: req('version'), cwd: opt('workspacePath') }),
-    output: strict({ version: req('version'), content: req('object') }),
+    output: strict({ version: req('version'), content: req('boundedText') }),
   },
   coding_git_diff: {
     effect: 'read-only',
     input: strict({ version: req('version'), cwd: opt('workspacePath'), staged: opt('boolean'), paths: opt('workspacePathArray') }),
-    output: strict({ version: req('version'), content: req('object') }),
+    output: strict({ version: req('version'), content: req('boundedText') }),
   },
   coding_git_log: {
     effect: 'read-only',
     input: strict({ version: req('version'), cwd: opt('workspacePath'), ref: opt('string'), maxEntries: opt('nonNegativeInteger') }),
-    output: strict({ version: req('version'), content: req('object') }),
+    output: strict({ version: req('version'), content: req('boundedText') }),
   },
 };
 
 export const CODING_COMPATIBILITY_POLICY = {
   currentVersion: CODING_CONTRACT_VERSION,
+  unknownPrimitive: 'reject',
   unknownRequestFields: 'reject',
   unknownResponseFields: 'reject',
   unsupportedVersion: 'reject',
-  rule: 'Additive or semantic changes require an explicit contract update/version; v1 never guesses future semantics.',
+  rule: 'Contract v1 never guesses unknown primitive, field, or future-version semantics.',
 } as const;
 
 const FORBIDDEN_MODEL_ROOT_FIELDS = new Set([
   'workspaceRoot',
   'projectRoot',
+  'rootIdentity',
+  'rootRole',
   'rootPath',
   'canonicalRoot',
   'canonicalPath',
+  'auxiliaryRepoRoots',
+]);
+
+const FORBIDDEN_MODEL_CAPABILITY_FIELDS = new Set([
+  'authorization',
+  'authorizationId',
+  'grant',
+  'grantId',
+  'capability',
+  'capabilities',
+  'capabilityToken',
+  'token',
 ]);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function validateExactRecord(
+  value: unknown,
+  label: string,
+  allowedKeys: readonly string[],
+  requiredKeys: readonly string[] = allowedKeys,
+): CodingContractResult<Record<string, unknown>> {
+  if (!isRecord(value)) return fail('P2_INVALID_FIELD', `${label} must be an object`);
+  const allowed = new Set(allowedKeys);
+  const unknown = Object.keys(value).find((key) => !allowed.has(key));
+  if (unknown) {
+    return fail('P2_UNKNOWN_FIELD', `${label} contains unknown field ${unknown}`, { field: unknown });
+  }
+  const missing = requiredKeys.find((key) => !(key in value));
+  if (missing) {
+    return fail('P2_MISSING_FIELD', `${label} is missing ${missing}`, { field: missing });
+  }
+  return pass(value);
+}
+
+function isNonNegativeInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 }
 
 function validatePatchFiles(value: unknown): CodingContractResult<readonly CodingPatchFile[]> {
@@ -518,21 +730,149 @@ function validatePatchFiles(value: unknown): CodingContractResult<readonly Codin
 
   const files: CodingPatchFile[] = [];
   for (const entry of value) {
-    if (!isRecord(entry)) {
-      return fail('P2_INVALID_FIELD', 'each patch entry must be an object');
+    const exact = validateExactRecord(entry, 'patch entry', ['path', 'patch']);
+    if (!exact.ok) return exact;
+    if (typeof exact.value.patch !== 'string') {
+      return fail('P2_INVALID_FIELD', 'patch entry patch must be a string');
     }
-    const keys = Object.keys(entry);
-    if (keys.some((key) => key !== 'path' && key !== 'patch')) {
-      return fail('P2_UNKNOWN_FIELD', 'patch entries accept only path and patch');
-    }
-    if (typeof entry.path !== 'string' || typeof entry.patch !== 'string') {
-      return fail('P2_INVALID_FIELD', 'patch entry path and patch must be strings');
-    }
-    const path = validateWorkspaceRelativePath(entry.path);
+    const path = validateWorkspaceRelativePath(exact.value.path);
     if (!path.ok) return path;
-    files.push({ path: path.value, patch: entry.patch });
+    files.push({ path: path.value, patch: exact.value.patch });
   }
   return pass(files);
+}
+
+function validateBoundedText(value: unknown): CodingContractResult<CodingBoundedText> {
+  const exact = validateExactRecord(
+    value,
+    'bounded text',
+    ['text', 'bytesSeen', 'bytesRetained', 'moreAvailable'],
+  );
+  if (!exact.ok) return exact;
+  const record = exact.value;
+  if (
+    typeof record.text !== 'string' ||
+    !isNonNegativeInteger(record.bytesSeen) ||
+    !isNonNegativeInteger(record.bytesRetained) ||
+    typeof record.moreAvailable !== 'boolean' ||
+    record.bytesRetained > record.bytesSeen
+  ) {
+    return fail('P2_INVALID_FIELD', 'bounded text retention fields are invalid');
+  }
+  return pass({
+    text: record.text,
+    bytesSeen: record.bytesSeen,
+    bytesRetained: record.bytesRetained,
+    moreAvailable: record.moreAvailable,
+  });
+}
+
+function validateFileListEntries(value: unknown): CodingContractResult<readonly CodingFileListEntry[]> {
+  if (!Array.isArray(value)) return fail('P2_INVALID_FIELD', 'entries must be an array');
+  const entries: CodingFileListEntry[] = [];
+  for (const item of value) {
+    const exact = validateExactRecord(item, 'file-list entry', ['path', 'kind']);
+    if (!exact.ok) return exact;
+    const path = validateWorkspaceRelativePath(exact.value.path);
+    if (!path.ok) return path;
+    const kind = exact.value.kind;
+    if (kind !== 'file' && kind !== 'directory' && kind !== 'symlink' && kind !== 'other') {
+      return fail('P2_INVALID_FIELD', 'file-list entry kind is invalid');
+    }
+    entries.push({ path: path.value, kind });
+  }
+  return pass(entries);
+}
+
+function validateFileSearchMatches(value: unknown): CodingContractResult<readonly CodingFileSearchMatch[]> {
+  if (!Array.isArray(value)) return fail('P2_INVALID_FIELD', 'matches must be an array');
+  const matches: CodingFileSearchMatch[] = [];
+  for (const item of value) {
+    const exact = validateExactRecord(
+      item,
+      'file-search match',
+      ['path', 'line', 'text'],
+      ['path', 'text'],
+    );
+    if (!exact.ok) return exact;
+    const path = validateWorkspaceRelativePath(exact.value.path);
+    if (!path.ok) return path;
+    if (typeof exact.value.text !== 'string') {
+      return fail('P2_INVALID_FIELD', 'file-search match text must be a string');
+    }
+    if ('line' in exact.value && (!isNonNegativeInteger(exact.value.line) || exact.value.line === 0)) {
+      return fail('P2_INVALID_FIELD', 'file-search match line must be a positive safe integer');
+    }
+    matches.push({
+      path: path.value,
+      text: exact.value.text,
+      ...('line' in exact.value ? { line: exact.value.line as number } : {}),
+    });
+  }
+  return pass(matches);
+}
+
+function validateProcessLifecycle(value: unknown): CodingContractResult<CodingProcessLifecycle> {
+  const exact = validateExactRecord(value, 'process lifecycle', CODING_PROCESS_LIFECYCLE_FIELDS);
+  if (!exact.ok) return exact;
+  const record = exact.value;
+  if (record.state !== 'running' && record.state !== 'exited') {
+    return fail('P2_INVALID_FIELD', 'process lifecycle state must be running or exited');
+  }
+  if (!(record.exitCode === null || isNonNegativeInteger(record.exitCode))) {
+    return fail('P2_INVALID_FIELD', 'process exitCode must be null or a non-negative safe integer');
+  }
+  if (!(record.exitSignal === null || typeof record.exitSignal === 'string')) {
+    return fail('P2_INVALID_FIELD', 'process exitSignal must be null or a string');
+  }
+  if (
+    typeof record.timedOut !== 'boolean' ||
+    typeof record.cancelled !== 'boolean' ||
+    typeof record.teardownConfirmed !== 'boolean'
+  ) {
+    return fail('P2_INVALID_FIELD', 'process lifecycle flags must be booleans');
+  }
+  if (record.state === 'running' && (record.exitCode !== null || record.exitSignal !== null)) {
+    return fail('P2_INVALID_FIELD', 'running process cannot report an exit status');
+  }
+  if (record.state === 'running' && record.teardownConfirmed) {
+    return fail('P2_INVALID_FIELD', 'running process cannot confirm teardown');
+  }
+  if (record.state === 'exited' && record.exitCode === null && record.exitSignal === null) {
+    return fail('P2_INVALID_FIELD', 'exited process must report exitCode or exitSignal');
+  }
+  return pass({
+    state: record.state,
+    exitCode: record.exitCode,
+    exitSignal: record.exitSignal,
+    timedOut: record.timedOut,
+    cancelled: record.cancelled,
+    teardownConfirmed: record.teardownConfirmed,
+  });
+}
+
+function validateProcessStream(value: unknown): CodingContractResult<CodingProcessStream> {
+  const exact = validateExactRecord(value, 'process stream', CODING_PROCESS_STREAM_FIELDS);
+  if (!exact.ok) return exact;
+  const record = exact.value;
+  if (
+    typeof record.data !== 'string' ||
+    !isNonNegativeInteger(record.bytesSeen) ||
+    !isNonNegativeInteger(record.bytesRetained) ||
+    typeof record.moreAvailable !== 'boolean' ||
+    !isNonNegativeInteger(record.nextOffset) ||
+    record.bytesRetained > record.bytesSeen ||
+    record.nextOffset > record.bytesSeen
+  ) {
+    return fail('P2_INVALID_FIELD', 'process stream retention/continuation fields are invalid');
+  }
+  return pass({
+    data: record.data,
+    bytesSeen: record.bytesSeen,
+    bytesRetained: record.bytesRetained,
+    moreAvailable: record.moreAvailable,
+    nextOffset: record.nextOffset,
+  });
 }
 
 function validateField(kind: CodingFieldKind, value: unknown): CodingContractResult<unknown> {
@@ -545,27 +885,36 @@ function validateField(kind: CodingFieldKind, value: unknown): CodingContractRes
       return typeof value === 'string'
         ? pass(value)
         : fail('P2_INVALID_FIELD', 'expected string');
+    case 'nonEmptyString':
+      return typeof value === 'string' && value.length > 0
+        ? pass(value)
+        : fail('P2_INVALID_FIELD', 'expected non-empty string');
     case 'boolean':
       return typeof value === 'boolean'
         ? pass(value)
         : fail('P2_INVALID_FIELD', 'expected boolean');
     case 'nonNegativeInteger':
-      return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+      return isNonNegativeInteger(value)
         ? pass(value)
         : fail('P2_INVALID_FIELD', 'expected non-negative safe integer');
+    case 'nullableExitCode':
+      return value === null || isNonNegativeInteger(value)
+        ? pass(value)
+        : fail('P2_INVALID_FIELD', 'expected null or non-negative safe integer');
+    case 'nullableString':
+      return value === null || typeof value === 'string'
+        ? pass(value)
+        : fail('P2_INVALID_FIELD', 'expected null or string');
     case 'stringArray':
       return Array.isArray(value) && value.every((item) => typeof item === 'string')
         ? pass(value)
         : fail('P2_INVALID_FIELD', 'expected string array');
     case 'workspacePath':
-      return typeof value === 'string'
-        ? validateWorkspaceRelativePath(value)
-        : fail('P2_INVALID_FIELD', 'expected workspace-relative path string');
+      return validateWorkspaceRelativePath(value);
     case 'workspacePathArray': {
       if (!Array.isArray(value)) return fail('P2_INVALID_FIELD', 'expected workspace-relative path array');
       const paths: WorkspaceRelativePath[] = [];
       for (const item of value) {
-        if (typeof item !== 'string') return fail('P2_INVALID_FIELD', 'expected workspace-relative path array');
         const path = validateWorkspaceRelativePath(item);
         if (!path.ok) return path;
         paths.push(path.value);
@@ -574,10 +923,16 @@ function validateField(kind: CodingFieldKind, value: unknown): CodingContractRes
     }
     case 'patchFiles':
       return validatePatchFiles(value);
-    case 'object':
-      return isRecord(value) ? pass(value) : fail('P2_INVALID_FIELD', 'expected object');
-    case 'array':
-      return Array.isArray(value) ? pass(value) : fail('P2_INVALID_FIELD', 'expected array');
+    case 'boundedText':
+      return validateBoundedText(value);
+    case 'fileListEntries':
+      return validateFileListEntries(value);
+    case 'fileSearchMatches':
+      return validateFileSearchMatches(value);
+    case 'processLifecycle':
+      return validateProcessLifecycle(value);
+    case 'processStream':
+      return validateProcessStream(value);
   }
 }
 
@@ -595,8 +950,16 @@ function validateSchemaObject(
     if (forbiddenRoot) {
       return fail(
         'P2_MODEL_WORKSPACE_ROOT_FORBIDDEN',
-        'workspace binding is receiver-owned; model-supplied workspace roots are forbidden',
+        'workspace/canonical binding is receiver-owned; model-supplied root facts are forbidden',
         { field: forbiddenRoot },
+      );
+    }
+    const forbiddenCapability = Object.keys(value).find((key) => FORBIDDEN_MODEL_CAPABILITY_FIELDS.has(key));
+    if (forbiddenCapability) {
+      return fail(
+        'P2_MODEL_CAPABILITY_FORBIDDEN',
+        'authorization/capability is receiver-owned and cannot be supplied by model/page payload',
+        { field: forbiddenCapability },
       );
     }
   }
@@ -610,6 +973,7 @@ function validateSchemaObject(
     });
   }
 
+  const validatedObject: Record<string, unknown> = {};
   for (const [fieldName, fieldSchema] of Object.entries(schema.fields)) {
     if (!(fieldName in value)) {
       if (fieldSchema.required) {
@@ -619,6 +983,7 @@ function validateSchemaObject(
       }
       continue;
     }
+
     const validated = validateField(fieldSchema.kind, value[fieldName]);
     if (!validated.ok) {
       return {
@@ -633,32 +998,80 @@ function validateSchemaObject(
         },
       };
     }
+    validatedObject[fieldName] = validated.value;
   }
 
-  return pass(value);
+  return pass(validatedObject);
 }
 
-/** Strict v1 request validator; no execution or I/O. */
-export function validateCodingPrimitiveInput<N extends CodingPrimitiveName>(
-  primitive: N,
+/** Strict raw request validator. Unknown primitive/version/fields fail closed. */
+export function validateCodingPrimitiveInput(
+  primitive: unknown,
   value: unknown,
-): CodingContractResult<CodingPrimitiveInputMap[N]> {
-  const result = validateSchemaObject(primitive, 'input', value);
-  return result.ok ? pass(result.value as unknown as CodingPrimitiveInputMap[N]) : result;
+): CodingContractResult<CodingPrimitiveInputMap[CodingPrimitiveName]> {
+  const name = validateCodingPrimitiveName(primitive);
+  if (!name.ok) return name;
+  const result = validateSchemaObject(name.value, 'input', value);
+  return result.ok
+    ? pass(result.value as unknown as CodingPrimitiveInputMap[CodingPrimitiveName])
+    : result;
 }
 
-/** Strict v1 response-shape validator for the future P1C/P2 adapter seam. */
-export function validateCodingPrimitiveOutput<N extends CodingPrimitiveName>(
-  primitive: N,
+/** Strict raw response validator for the future trusted P1C/P2 adapter seam. */
+export function validateCodingPrimitiveOutput(
+  primitive: unknown,
   value: unknown,
-): CodingContractResult<CodingPrimitiveOutputMap[N]> {
-  const result = validateSchemaObject(primitive, 'output', value);
-  return result.ok ? pass(result.value as unknown as CodingPrimitiveOutputMap[N]) : result;
+): CodingContractResult<CodingPrimitiveOutputMap[CodingPrimitiveName]> {
+  const name = validateCodingPrimitiveName(primitive);
+  if (!name.ok) return name;
+  const result = validateSchemaObject(name.value, 'output', value);
+  return result.ok
+    ? pass(result.value as unknown as CodingPrimitiveOutputMap[CodingPrimitiveName])
+    : result;
+}
+
+export interface CodingAdapterMatchSuccess<T> {
+  ok: true;
+  matches: readonly T[];
+}
+
+export interface CodingAdapterMatchFailure {
+  ok: false;
+  adapterCode: string;
+  message: string;
+  retryable?: boolean;
+}
+
+export type CodingAdapterMatchResult<T> = CodingAdapterMatchSuccess<T> | CodingAdapterMatchFailure;
+
+export type CodingMatchOutcome<T> =
+  | { ok: true; outcome: 'matches'; matches: readonly T[] }
+  | { ok: true; outcome: 'zero-match'; matches: readonly [] }
+  | { ok: false; outcome: 'hard-error'; error: CodingError };
+
+/** Zero matches are success; adapter failures remain typed hard errors. */
+export function classifyCodingMatches<T>(result: CodingAdapterMatchResult<T>): CodingMatchOutcome<T> {
+  if (!result.ok) {
+    return {
+      ok: false,
+      outcome: 'hard-error',
+      error: {
+        code: 'P2_ADAPTER_HARD_ERROR',
+        message: result.message,
+        retryable: result.retryable ?? false,
+        details: { adapterCode: result.adapterCode },
+      },
+    };
+  }
+  if (result.matches.length === 0) {
+    return { ok: true, outcome: 'zero-match', matches: [] };
+  }
+  return { ok: true, outcome: 'matches', matches: result.matches };
 }
 
 /**
- * Typed result wrapper. Error codes are machine-readable; P0 truncation
- * provenance remains the sole truncation provenance model.
+ * Typed result wrapper. Authorization evidence is intentionally absent;
+ * truncation provenance is the existing P0 type/authority.
  */
 export type CodingPrimitiveResult<N extends CodingPrimitiveName> =
   | {
@@ -680,8 +1093,5 @@ export type CodingPrimitiveResult<N extends CodingPrimitiveName> =
       truncation: ToolResultTruncationProvenance;
     };
 
-/**
- * Exact alias to the existing P0 projection/budget authority. P2 introduces no
- * competing 4k/8k constants, clamp policy, or truncation-provenance producer.
- */
+/** Exact alias to the existing P0 budget/truncation authority. */
 export const projectCodingToolResultForInjection = projectToolResultForInjection;
