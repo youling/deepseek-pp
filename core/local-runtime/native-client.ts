@@ -4,10 +4,10 @@
  *
  * Chrome's native messaging channel performs 4-byte little-endian length
  * framing automatically around every JSON message we post; the Rust host's
- * `framing.rs` reads the same framing. This client reuses the request
- * correlation/timeout pattern from `core/mcp/transports/native.ts` but speaks
- * the dedicated `deepseek-pp-local-runtime` operation contract — NOT the MCP
- * native launcher envelope.
+ * `framing.rs` reads the same framing. Port lifecycle, pending correlation,
+ * timeout/abort, disconnect cleanup, unmatched handling, and the transport
+ * ceiling are owned solely by `core/native/request-channel.ts` — this module
+ * only speaks the dedicated `deepseek-pp-local-runtime` operation contract.
  *
  * Authorization boundary: this client never authorizes execution. It only
  * carries a background-issued `grant_id` claim to the host, whose owner gate is
@@ -24,6 +24,10 @@ import {
   LOCAL_RUNTIME_HOST_ID,
   validateLocalRuntimeRequest,
 } from './contract';
+import {
+  requestNativeHost,
+  type NativeRequestId,
+} from '../native/request-channel';
 
 export type LocalRuntimeClientErrorCode =
   | 'local_runtime_native_messaging_unavailable'
@@ -42,110 +46,61 @@ export class LocalRuntimeClientError extends Error {
   }
 }
 
-interface PendingRequest {
-  resolve: (value: LocalRuntimeEnvelope) => void;
-  reject: (reason: Error) => void;
-  timer: ReturnType<typeof setTimeout>;
-}
-
-interface PortState {
-  port: chrome.runtime.Port;
-  pendingRequests: Map<string, PendingRequest>;
-}
-
-const MAX_NATIVE_MESSAGE_BYTES = 1 * 1024 * 1024;
-
-const portStateByHost = new Map<string, PortState>();
-
-function getPortState(): PortState {
-  const existing = portStateByHost.get(LOCAL_RUNTIME_HOST_ID);
-  if (existing) return existing;
-
-  if (!chrome.runtime?.connectNative) {
-    throw new LocalRuntimeClientError(
+function createLocalRuntimeChannelErrors() {
+  return {
+    unavailable: () => new LocalRuntimeClientError(
       'local_runtime_native_messaging_unavailable',
       'Browser native messaging is unavailable.',
-    );
-  }
-
-  const port = chrome.runtime.connectNative(LOCAL_RUNTIME_HOST_ID);
-  const state: PortState = { port, pendingRequests: new Map() };
-  portStateByHost.set(LOCAL_RUNTIME_HOST_ID, state);
-
-  port.onMessage.addListener((response: LocalRuntimeEnvelope) => {
-    const requestId = response?.request_id;
-    const pending = requestId != null ? state.pendingRequests.get(requestId) : undefined;
-    if (!pending) return;
-    state.pendingRequests.delete(requestId);
-    clearTimeout(pending.timer);
-    pending.resolve(response);
-  });
-
-  port.onDisconnect.addListener(() => {
-    const err = new LocalRuntimeClientError(
+    ),
+    disconnected: (detail?: string) => new LocalRuntimeClientError(
       'local_runtime_host_disconnected',
-      chrome.runtime.lastError?.message || 'Local Runtime native host disconnected.',
-    );
-    for (const pending of state.pendingRequests.values()) {
-      clearTimeout(pending.timer);
-      pending.reject(err);
-    }
-    state.pendingRequests.clear();
-    portStateByHost.delete(LOCAL_RUNTIME_HOST_ID);
-  });
+      detail || 'Local Runtime native host disconnected.',
+    ),
+    timeout: (timeoutMs: number) => new LocalRuntimeClientError(
+      'local_runtime_timeout',
+      `Local Runtime request exceeded ${timeoutMs} ms.`,
+    ),
+    payloadTooLarge: (bytes: number, ceiling: number) => new LocalRuntimeClientError(
+      'local_runtime_unknown_error',
+      `Local Runtime request is too large (${bytes} > ${ceiling} bytes).`,
+    ),
+    aborted: (signal: AbortSignal) => {
+      if (signal.reason instanceof Error) return signal.reason;
+      return new DOMException('Local Runtime request was aborted.', 'AbortError');
+    },
+  };
+}
 
-  return state;
+function extractLocalRuntimeResponseId(response: unknown): NativeRequestId | null | undefined {
+  const record = response as { request_id?: unknown } | null;
+  if (typeof record !== 'object' || record === null) return undefined;
+  return typeof record.request_id === 'string' ? record.request_id : undefined;
 }
 
 /**
  * Send a validated Local Runtime request and await the correlated response.
  * Validates the outgoing request at the TS trust boundary before it is posted.
+ * Transport ceiling / correlation / timeout / abort / disconnect are owned by
+ * the shared native request channel.
  */
 export function sendLocalRuntimeRequest(
   request: LocalRuntimeRequest,
-  options?: { timeoutMs?: number },
+  options?: { timeoutMs?: number; signal?: AbortSignal },
 ): Promise<LocalRuntimeEnvelope> {
   validateLocalRuntimeRequest(request);
 
   const timeoutMs = options?.timeoutMs ?? 5_000;
-  const bodyBytes = new Blob([JSON.stringify(request)]).size;
-  if (bodyBytes > MAX_NATIVE_MESSAGE_BYTES) {
-    throw new LocalRuntimeClientError(
-      'local_runtime_unknown_error',
-      `Local Runtime request is too large (${bodyBytes} > ${MAX_NATIVE_MESSAGE_BYTES} bytes).`,
-    );
-  }
-
-  return new Promise((resolve, reject) => {
-    let state: PortState;
-    try {
-      state = getPortState();
-    } catch (err) {
-      reject(err);
-      return;
-    }
-
-    const timer = setTimeout(() => {
-      state.pendingRequests.delete(request.request_id);
-      reject(new LocalRuntimeClientError(
-        'local_runtime_timeout',
-        `Local Runtime request exceeded ${timeoutMs} ms.`,
-      ));
-    }, timeoutMs);
-
-    state.pendingRequests.set(request.request_id, { resolve, reject, timer });
-    try {
-      state.port.postMessage(request);
-    } catch (err) {
-      clearTimeout(timer);
-      state.pendingRequests.delete(request.request_id);
-      reject(err instanceof Error ? err : new LocalRuntimeClientError('local_runtime_unknown_error', String(err)));
-    }
+  return requestNativeHost<LocalRuntimeEnvelope>(LOCAL_RUNTIME_HOST_ID, request, {
+    requestId: request.request_id,
+    extractResponseId: extractLocalRuntimeResponseId,
+    timeoutMs,
+    signal: options?.signal,
+    errors: createLocalRuntimeChannelErrors(),
   });
 }
 
 /** Convenience typed wrappers for the two operations. */
-export function localRuntimeStatus(options?: { timeoutMs?: number }): Promise<LocalRuntimeStatusEnvelope> {
+export function localRuntimeStatus(options?: { timeoutMs?: number; signal?: AbortSignal }): Promise<LocalRuntimeStatusEnvelope> {
   const request: LocalRuntimeRequest = {
     protocol: 'deepseek-pp-local-runtime',
     version: 1,
@@ -163,6 +118,7 @@ export function localRuntimeExec(input: {
   workspaceId?: string;
   timeoutMs?: number;
   maxOutputBytes?: number;
+  signal?: AbortSignal;
 }): Promise<LocalRuntimeExecEnvelope> {
   const request: LocalRuntimeRequest = {
     protocol: 'deepseek-pp-local-runtime',
@@ -176,7 +132,7 @@ export function localRuntimeExec(input: {
     max_output_bytes: input.maxOutputBytes,
     args: input.args,
   };
-  return sendLocalRuntimeRequest(request, { timeoutMs: input.timeoutMs }).then(assertExec);
+  return sendLocalRuntimeRequest(request, { timeoutMs: input.timeoutMs, signal: input.signal }).then(assertExec);
 }
 
 function assertStatus(envelope: LocalRuntimeEnvelope): LocalRuntimeStatusEnvelope {
