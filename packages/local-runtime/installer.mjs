@@ -82,7 +82,7 @@ function resolveLocations({ os = platform(), browser, home = homedir(), localApp
     appDataRoot,
     hostInstallDir,
     manifestDir,
-    manifestPath: resolve(manifestDir, manifestFileName),
+    manifestPath: path.resolve(manifestDir, manifestFileName),
     registryKey: os === 'win32' ? getWindowsRegistryKey(browser) : null,
   };
 }

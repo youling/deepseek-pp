@@ -159,7 +159,12 @@ function listSourceFiles(root: string): string[] {
     const path = join(root, entry);
     if (statSync(path).isDirectory()) {
       files.push(...listSourceFiles(path));
-    } else if (path.endsWith('.ts') || path.endsWith('.tsx')) {
+    } else if (
+      (path.endsWith('.ts') || path.endsWith('.tsx')) &&
+      !path.endsWith('.d.ts') &&
+      !path.endsWith('.d.mts') &&
+      !path.endsWith('.d.cts')
+    ) {
       files.push(normalize(path));
     }
   }

@@ -60,19 +60,47 @@ pub fn profiles() -> Vec<String> {
 
 /// Returns the host-owned executable + args for a profile. The command is
 /// defined by the host, never by the browser.
+///
+/// Windows ConPTY boundary isolation (P1B3): the canary helper is a plain
+/// Rust binary that does not handle ConPTY's initial DSR (`\x1b[6n`) and
+/// hangs when spawned directly as a ConPTY client (observed as 4-byte
+/// output + timeout, CI 34456939702). Wrapping the helper via `cmd /C`
+/// makes `cmd.exe` the ConPTY client (which correctly answers DSR) and the
+/// helper runs as a normal child of `cmd`. The helper then inherits the
+/// Job Object membership from `cmd`, so real process-tree ownership is
+/// retained. We use the absolute `C:\Windows\System32\cmd.exe` path to
+/// avoid `CommandBuilder::search_path` issues inside `cargo test` where
+/// `PATH` may be polluted.
 fn profile_command(profile: &str, args: &[String]) -> Option<(String, Vec<String>)> {
     let me = std::env::current_exe().ok()?;
     let me = me.to_string_lossy().into_owned();
+    let cmd = if cfg!(windows) {
+        std::env::var("ComSpec").unwrap_or_else(|_| r"C:\Windows\System32\cmd.exe".to_string())
+    } else {
+        "cmd".to_string()
+    };
     match profile {
         CANARY_PROFILE => {
-            let mut v = vec!["--echo-canary".to_string()];
-            v.extend_from_slice(args);
-            Some((me, v))
+            if cfg!(windows) {
+                let mut v = vec!["/C".to_string(), me, "--echo-canary".to_string()];
+                v.extend_from_slice(args);
+                Some((cmd, v))
+            } else {
+                let mut v = vec!["--echo-canary".to_string()];
+                v.extend_from_slice(args);
+                Some((me, v))
+            }
         }
         CANARY_SPAWN_SLEEPER_PROFILE => {
-            let mut v = vec!["--spawn-sleeper".to_string()];
-            v.extend_from_slice(args);
-            Some((me, v))
+            if cfg!(windows) {
+                let mut v = vec!["/C".to_string(), me, "--spawn-sleeper".to_string()];
+                v.extend_from_slice(args);
+                Some((cmd, v))
+            } else {
+                let mut v = vec!["--spawn-sleeper".to_string()];
+                v.extend_from_slice(args);
+                Some((me, v))
+            }
         }
         _ => None,
     }
@@ -122,7 +150,23 @@ pub fn handle_exec(request: RuntimeRequest) -> Envelope {
         }
     };
 
-    let workspace_id = request.workspace_id.clone().unwrap_or_else(|| "(none)".into());
+    // The wire's workspace_id is metadata only; the cwd is host-bound,
+    // canonical, and P1C-ready. Model cannot select an absolute path.
+    let workspace_hint = request.workspace_id.clone();
+    let workspace_log = workspace_hint.clone().unwrap_or_else(|| "(none)".into());
+    let bound_root = match crate::workspace::resolve_for_exec(workspace_hint.as_deref()) {
+        Ok(p) => p,
+        Err(e) => {
+            return Envelope::err(
+                req_id,
+                "runtime.exec",
+                "runtime_workspace_unavailable",
+                format!("host workspace unavailable: {}", e),
+                true,
+            );
+        }
+    };
+    let cwd_str = bound_root.to_string_lossy().into_owned();
     let timeout = request.timeout_ms.unwrap_or(10_000);
     let budget = request.max_output_bytes.unwrap_or(4096);
 
@@ -144,13 +188,11 @@ pub fn handle_exec(request: RuntimeRequest) -> Envelope {
         crate::executor::ExecOptions {
             program,
             args,
-            cwd: std::env::current_dir()
-                .ok()
-                .map(|p| p.to_string_lossy().into_owned()),
+            cwd: Some(cwd_str),
             env: vec![
                 ("DEEPSEEK_PP_RUNTIME_GRANT".to_string(), grant),
                 ("DEEPSEEK_PP_RUNTIME_PROFILE".to_string(), profile),
-                ("DEEPSEEK_PP_RUNTIME_WORKSPACE".to_string(), workspace_id),
+                ("DEEPSEEK_PP_RUNTIME_WORKSPACE".to_string(), workspace_log),
             ],
             timeout: Duration::from_millis(timeout),
             max_output_bytes: budget,
@@ -209,6 +251,16 @@ pub fn canary_main(args: &[String]) -> i32 {
         println!("deepseek-pp canary echo: {}", rest.join(" "));
         return 0;
     }
+    if let Some(pos) = args.iter().position(|a| a == "--exit-code") {
+        let code: i32 = args.get(pos + 1).and_then(|v| v.parse().ok()).unwrap_or(1);
+        std::process::exit(code);
+    }
+    if args.iter().any(|a| a == "--emit-burst") {
+        for _ in 0..2000 {
+            println!("0123456789012345678901234567890123456789");
+        }
+        return 0;
+    }
     if let Some(pos) = args.iter().position(|a| a == "--spawn-sleeper") {
         let sleep_ms: u64 = args.get(pos + 1).and_then(|v| v.parse().ok()).unwrap_or(5000);
         spawn_descendant_sleeper(sleep_ms);
@@ -222,7 +274,23 @@ pub fn canary_main(args: &[String]) -> i32 {
 /// process-group teardown test has a true process tree. The descendant is
 /// created by the leader AFTER the leader is already assigned to the Job
 /// Object, so inheritance places it in the same job.
+///
+/// The executor's per-run barrier (`DEEPSEEK_PP_RUNTIME_BARRIER_FILE`) is used
+/// to close the spawn→assign escape race: after `portable-pty` forks the
+/// leader and before the descendant is created, the leader waits until the
+/// host confirms supervision succeeded and touches the barrier file.
 fn spawn_descendant_sleeper(sleep_ms: u64) {
+    const BARRIER_ENV: &str = "DEEPSEEK_PP_RUNTIME_BARRIER_FILE";
+    if let Ok(barrier) = std::env::var(BARRIER_ENV) {
+        let path = std::path::PathBuf::from(barrier);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if path.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
     let descriptor = descendant_cmd();
     if let Some(mut cmd) = descriptor {
         let _ = cmd.spawn();

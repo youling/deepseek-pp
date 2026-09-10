@@ -106,6 +106,50 @@ jobs:
         working-directory: runtime
         run: cargo build --release
 
+      - name: Generate SHA-256 and provenance
+        working-directory: runtime
+        shell: pwsh
+        run: |
+          $bin = "target/x86_64-pc-windows-msvc/release/deepseek-pp-local-runtime.exe"
+          if (-not (Test-Path $bin)) { $bin = "target/release/deepseek-pp-local-runtime.exe" }
+          if (-not (Test-Path $bin)) { throw "release binary not found at $bin" }
+          $hash = (Get-FileHash $bin -Algorithm SHA256).Hash.ToLower()
+          "$hash  $(Split-Path $bin -Leaf)" | Out-File -Encoding ascii "$bin.sha256"
+          $cargoLockHash = (Get-FileHash "Cargo.lock" -Algorithm SHA256).Hash.ToLower()
+          $commit = "${{ github.sha }}"
+          if (-not $commit) { $commit = (git rev-parse HEAD).Trim() }
+          $rustcVer = (rustc --version)
+          $cargoVer = (cargo --version)
+          $provenance = @{
+            head_sha = $commit
+            target = "x86_64-pc-windows-msvc"
+            rustc = $rustcVer
+            cargo = $cargoVer
+            cargo_lock_sha256 = $cargoLockHash
+            binary = (Split-Path $bin -Leaf)
+            binary_sha256 = $hash
+            built_at = (Get-Date -Format o)
+          } | ConvertTo-Json -Depth 4
+          $provenance | Out-File -Encoding utf8 "provenance.json"
+          Write-Host "SHA256: $hash"
+          Write-Host "Provenance:"
+          Write-Host $provenance
+          Get-Content "$bin.sha256"
+          Get-Content "provenance.json"
+
+      - name: Upload Windows release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deepseek-pp-local-runtime-windows-x64-${{ github.sha }}
+          path: |
+            runtime/target/x86_64-pc-windows-msvc/release/deepseek-pp-local-runtime.exe
+            runtime/target/release/deepseek-pp-local-runtime.exe
+            runtime/target/x86_64-pc-windows-msvc/release/deepseek-pp-local-runtime.exe.sha256
+            runtime/target/release/deepseek-pp-local-runtime.exe.sha256
+            runtime/provenance.json
+          if-no-files-found: error
+          retention-days: 30
+
       - name: Run Rust tests (unit + integration)
         working-directory: runtime
         run: cargo test --all-targets

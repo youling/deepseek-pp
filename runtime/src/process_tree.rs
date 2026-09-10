@@ -1,14 +1,16 @@
 //! Process-tree ownership and teardown.
 //!
-//! On Windows, every owned process tree is assigned to a Job Object created
-//! with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`; teardown terminates the whole job
-//! and its active-process count is verified to reach zero before success is
-//! claimed. On POSIX, the leader owns a process group and cancellation signals
-//! the whole group before escalation.
+//! On Windows, every owned process tree is assigned to a per-run Job Object
+//! created with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`; teardown terminates the
+//! whole job and its active-process count is verified to reach zero before
+//! success is claimed. On POSIX (Unix), the leader owns a process group and
+//! cancellation signals the whole group (TERM then KILL) with existence
+//! verification before success is claimed.
 //!
 //! The run owns one run ID, deadline, abort signal, and bounded outputs (see
 //! `executor.rs`). Detached descendants are an explicit unsupported/error case,
-//! not a silent success.
+//! not a silent success. Any wait/query/kill/assignment failure is fail-closed
+//! and never reported as `teardown_confirmed:true`.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -19,6 +21,8 @@ pub enum TreeError {
     JobCreate(String),
     #[error("failed to assign process {pid} to job: {details}")]
     Assign { pid: u32, details: String },
+    #[error("failed to establish process-group ownership for {pid}: {details}")]
+    GroupSetup { pid: u32, details: String },
     #[error("failed to terminate process tree: {0}")]
     Teardown(String),
     #[error("process-tree teardown NOT confirmed: owned processes may remain")]
@@ -47,6 +51,8 @@ impl CancelToken {
 pub struct ProcessTreeGuard {
     #[cfg(windows)]
     job: Option<windows_job::JobHandle>,
+    #[cfg(unix)]
+    pgid: i32,
     #[allow(dead_code)]
     pid: u32,
     confirmed: Arc<std::sync::atomic::AtomicBool>,
@@ -55,23 +61,56 @@ pub struct ProcessTreeGuard {
 impl ProcessTreeGuard {
     /// Create supervision for an already-spawned leader process identified by
     /// `pid`.
+    ///
+    /// Windows: creates an unnamed per-run Job Object and assigns the leader.
+    /// Unnamed avoids global-namespace collisions and the NUL-termination
+    /// failure that broke `CreateJobObjectW` (Win32 error 3).
+    ///
+    /// Unix: places the leader in its own process group (`setpgid`) so later
+    /// `kill(-pgid)` signals the whole owned tree. `portable-pty` already
+    /// fork+setsids the PTY child into its own session on most Unix targets,
+    /// in which case `setpgid` fails with EACCES/EPERM because the child is a
+    /// session leader; that is already isolated, so we fall back to the
+    /// leader's current pgid discovered via `getpgid`. If `getpgid` also
+    /// fails (leader already reaped), supervision fails closed.
     pub fn supervise(pid: u32) -> Result<Self, TreeError> {
         #[cfg(windows)]
         {
             let job = windows_job::create_kill_on_close_job().map_err(TreeError::JobCreate)?;
-            windows_job::assign_process(&job, pid).map_err(|details| TreeError::Assign { pid, details })?;
+            windows_job::assign_process(&job, pid)
+                .map_err(|details| TreeError::Assign { pid, details })?;
             return Ok(Self {
                 job: Some(job),
                 pid,
                 confirmed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             });
         }
-        #[cfg(not(windows))]
+        #[cfg(unix)]
         {
-            Ok(Self {
+            let pid_i = pid as i32;
+            unsafe {
+                let _ = libc::setpgid(pid_i, pid_i);
+            }
+            let pgid = unsafe { libc::getpgid(pid_i) };
+            if pgid < 0 {
+                let err = std::io::Error::last_os_error();
+                return Err(TreeError::GroupSetup {
+                    pid,
+                    details: format!("getpgid({}) failed: {}", pid, err),
+                });
+            }
+            return Ok(Self {
+                pgid,
                 pid,
                 confirmed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            })
+            });
+        }
+        #[cfg(not(any(windows, unix)))]
+        {
+            let _ = pid;
+            return Err(TreeError::Teardown(
+                "process-tree supervision unsupported on this platform".into(),
+            ));
         }
     }
 
@@ -80,46 +119,200 @@ impl ProcessTreeGuard {
     pub fn cancel_tree(&mut self) -> Result<(), TreeError> {
         #[cfg(windows)]
         {
-            if let Some(job) = self.job.take() {
-                windows_job::terminate_job(&job)
-                    .map_err(|source| TreeError::Teardown(format!("terminate job: {}", source)))?;
-                if windows_job::active_process_count(&job) != 0 {
+            let job = match &self.job {
+                Some(j) => j,
+                None => {
                     return Err(TreeError::Unconfirmed);
                 }
-                self.confirmed.store(true, Ordering::SeqCst);
+            };
+            windows_job::terminate_job(job)
+                .map_err(|source| TreeError::Teardown(format!("terminate job: {}", source)))?;
+            for _ in 0..100 {
+                match windows_job::active_process_count(job) {
+                    Ok(0) => {
+                        self.confirmed.store(true, Ordering::SeqCst);
+                        return Ok(());
+                    }
+                    Ok(_) => std::thread::sleep(std::time::Duration::from_millis(50)),
+                    Err(details) => {
+                        return Err(TreeError::Teardown(format!(
+                            "query job active count: {}",
+                            details
+                        )));
+                    }
+                }
             }
-            Ok(())
+            return Err(TreeError::Unconfirmed);
         }
-        #[cfg(not(windows))]
+        #[cfg(unix)]
         {
-            // POSIX process-group teardown. The leader's group is signalled.
-            let pid = self.pid as i32;
-            unsafe {
-                libc_posix::kill(-pid, libc_posix::SIGTERM);
+            unix_tree::terminate_group(self.pgid)?;
+            for _ in 0..100 {
+                if unix_tree::group_is_empty(self.pgid) {
+                    self.confirmed.store(true, Ordering::SeqCst);
+                    return Ok(());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
             }
-            // Allow a brief grace period, then escalate. Confirmation is best
-            // effort on POSIX where no kernel job object exists; we verify the
-            // leader exited via the executor's wait, and mark unconfirmed only
-            // if the caller cannot independently verify (handled in executor).
-            self.confirmed.store(true, Ordering::SeqCst);
-            Ok(())
+            return Err(TreeError::Unconfirmed);
+        }
+        #[cfg(not(any(windows, unix)))]
+        {
+            return Err(TreeError::Unconfirmed);
+        }
+    }
+
+    /// Verify a normally-exited leader left no owned descendants. Must be
+    /// called on the `try_wait()==Some` path before claiming
+    /// `teardown_confirmed:true`. If descendants linger, they are terminated
+    /// and re-verified; any query/kill failure is fail-closed.
+    pub fn confirm_clean_exit(&mut self) -> Result<(), TreeError> {
+        if self.is_confirmed() {
+            return Ok(());
+        }
+        #[cfg(windows)]
+        {
+            let job = match &self.job {
+                Some(j) => j,
+                None => return Err(TreeError::Unconfirmed),
+            };
+            match windows_job::active_process_count(job) {
+                Ok(0) => {
+                    self.confirmed.store(true, Ordering::SeqCst);
+                    return Ok(());
+                }
+                Ok(_) => {
+                    windows_job::terminate_job(job)
+                        .map_err(|s| TreeError::Teardown(format!("terminate lingering job: {}", s)))?;
+                    for _ in 0..100 {
+                        match windows_job::active_process_count(job) {
+                            Ok(0) => {
+                                self.confirmed.store(true, Ordering::SeqCst);
+                                return Ok(());
+                            }
+                            Ok(_) => std::thread::sleep(std::time::Duration::from_millis(50)),
+                            Err(d) => {
+                                return Err(TreeError::Teardown(format!(
+                                    "query lingering job: {}",
+                                    d
+                                )))
+                            }
+                        }
+                    }
+                    return Err(TreeError::Unconfirmed);
+                }
+                Err(d) => {
+                    return Err(TreeError::Teardown(format!("query job: {}", d)));
+                }
+            }
+        }
+        #[cfg(unix)]
+        {
+            if unix_tree::group_is_empty(self.pgid) {
+                self.confirmed.store(true, Ordering::SeqCst);
+                return Ok(());
+            }
+            unix_tree::terminate_group(self.pgid)?;
+            for _ in 0..100 {
+                if unix_tree::group_is_empty(self.pgid) {
+                    self.confirmed.store(true, Ordering::SeqCst);
+                    return Ok(());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            return Err(TreeError::Unconfirmed);
+        }
+        #[cfg(not(any(windows, unix)))]
+        {
+            return Err(TreeError::Unconfirmed);
         }
     }
 
     pub fn is_confirmed(&self) -> bool {
         self.confirmed.load(Ordering::SeqCst)
     }
+
+    /// Test-only introspection: number of live processes owned by the tree.
+    /// Used by P1B3 A/B/C diagnostics and teardown tests to prove a descendant
+    /// exists and is later gone. Never used to claim success unless confirming
+    /// zero.
+    #[doc(hidden)]
+    pub fn live_process_count(&self) -> u64 {
+        #[cfg(windows)]
+        {
+            match &self.job {
+                Some(j) => crate::process_tree::windows_job::active_process_count(j).unwrap_or(u64::MAX),
+                None => u64::MAX,
+            }
+        }
+        #[cfg(unix)]
+        {
+            if crate::process_tree::unix_tree::group_is_empty(self.pgid) { 0 } else { 1 }
+        }
+        #[cfg(not(any(windows, unix)))]
+        {
+            0
+        }
+    }
 }
 
-#[cfg(not(windows))]
-mod libc_posix {
-    pub const SIGTERM: i32 = 15;
-    pub fn kill(_pid: i32, _sig: i32) -> i32 {
-        // Minimal placeholder for non-Windows non-POSIX CI where we do not
-        // depend on the libc crate. POSIX process-group teardown is exercised
-        // on the closest supported POSIX CI target (Linux) which links libc.
-        // See process-tree integration tests.
-        -1
+#[cfg(unix)]
+pub(crate) mod unix_tree {
+    use super::TreeError;
+
+    pub fn group_is_empty(pgid: i32) -> bool {
+        if pgid <= 0 {
+            return false;
+        }
+        let r = unsafe { libc::kill(-pgid, 0) };
+        if r == 0 {
+            return false;
+        }
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(e) if e == libc::ESRCH => true,
+            _ => false,
+        }
+    }
+
+    fn kill_group(pgid: i32, sig: i32) -> Result<bool, TreeError> {
+        if pgid <= 0 {
+            return Err(TreeError::Teardown(format!("invalid pgid {}", pgid)));
+        }
+        let r = unsafe { libc::kill(-pgid, sig) };
+        if r == 0 {
+            return Ok(true);
+        }
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(e) if e == libc::ESRCH => Ok(false),
+            Some(e) => Err(TreeError::Teardown(format!(
+                "kill(-{}, {}) failed: errno {}",
+                pgid, sig, e
+            ))),
+            None => Err(TreeError::Teardown(format!(
+                "kill(-{}, {}) failed: unknown error",
+                pgid, sig
+            ))),
+        }
+    }
+
+    pub fn terminate_group(pgid: i32) -> Result<(), TreeError> {
+        if group_is_empty(pgid) {
+            return Ok(());
+        }
+        match kill_group(pgid, libc::SIGTERM)? {
+            false => return Ok(()),
+            true => {}
+        }
+        for _ in 0..10 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            if group_is_empty(pgid) {
+                return Ok(());
+            }
+        }
+        match kill_group(pgid, libc::SIGKILL)? {
+            false => Ok(()),
+            true => Ok(()),
+        }
     }
 }
 
@@ -138,7 +331,7 @@ mod windows_job {
         JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
         JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
         JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, PROCESS_QUERY_LIMITED_INFORMATION,
-        PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+        PROCESS_SET_QUOTA, PROCESS_TERMINATE, SYNCHRONIZE,
     };
     use std::ptr;
 
@@ -160,18 +353,10 @@ mod windows_job {
     const PROCESS_ACCESS: DWORD = PROCESS_QUERY_LIMITED_INFORMATION
         | PROCESS_SET_QUOTA
         | PROCESS_TERMINATE
-        | 0x0400; // SYNCHRONIZE (0x00100000 reserved conflict; 0x0400 is not SYNCHRONIZE)
+        | SYNCHRONIZE;
 
     pub fn create_kill_on_close_job() -> Result<JobHandle, String> {
-        let name: Vec<u16> = format!("DeepSeekPPRuntimeCanaryJob{}", std::process::id())
-            .encode_utf16()
-            .collect();
-        let handle = unsafe {
-            CreateJobObjectW(
-                ptr::null_mut(),
-                name.as_ptr(),
-            )
-        };
+        let handle = unsafe { CreateJobObjectW(ptr::null_mut(), ptr::null()) };
         if handle.is_null() {
             return Err(format!("CreateJobObjectW failed: {}", last_error()));
         }
@@ -196,13 +381,7 @@ mod windows_job {
     }
 
     pub fn assign_process(job: &JobHandle, pid: u32) -> Result<(), String> {
-        let process = unsafe {
-            OpenProcess(
-                PROCESS_ACCESS,
-                FALSE,
-                pid,
-            )
-        };
+        let process = unsafe { OpenProcess(PROCESS_ACCESS, FALSE, pid) };
         if process.is_null() {
             return Err(format!("OpenProcess({}) failed: {}", pid, last_error()));
         }
@@ -227,9 +406,7 @@ mod windows_job {
         Ok(())
     }
 
-    /// Number of active (non-terminated) processes assigned to the job right
-    /// now. Used to confirm the owned tree has fully exited.
-    pub fn active_process_count(job: &JobHandle) -> u64 {
+    pub fn active_process_count(job: &JobHandle) -> Result<u64, String> {
         let mut info: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { std::mem::zeroed() };
         let result = unsafe {
             QueryInformationJobObject(
@@ -241,10 +418,9 @@ mod windows_job {
             )
         };
         if result == 0 {
-            // Cannot query; treat as unconfirmed (fail-closed).
-            return 1;
+            return Err(format!("QueryInformationJobObject failed: {}", last_error()));
         }
-        info.ActiveProcesses.into()
+        Ok(info.ActiveProcesses.into())
     }
 
     fn last_error() -> String {
