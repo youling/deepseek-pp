@@ -86,7 +86,11 @@ fn native_status_round_trip() {
     assert_eq!(resp["ok"], true);
     assert_eq!(resp["host"]["host_id"], HOST_ID);
     assert_eq!(resp["host"]["contract_version"], CONTRACT_VERSION);
-    assert!(resp["host"]["profiles"].as_array().unwrap().len() >= 1);
+    // P1C2 production single: only canary.echo is advertised; spawn_sleeper is
+    // test-internal and never model-selectable.
+    let profiles = resp["host"]["profiles"].as_array().unwrap();
+    assert_eq!(profiles.len(), 1);
+    assert_eq!(profiles[0], "canary.echo");
     assert!(resp["host"]["platform"].as_str().is_some());
 }
 
@@ -101,7 +105,10 @@ fn future_version_fails_closed_over_wire() {
 }
 
 #[test]
-fn exec_without_grant_fails_closed() {
+fn exec_without_grant_reaches_profile_boundary() {
+    // P1C2: grant_id is correlation/audit metadata only, never authorization
+    // evidence. The background authorization path is the sole authority, so a
+    // missing grant must NOT gate execution at the host boundary.
     let mut host = spawn_host();
     let req = serde_json::json!({
         "protocol": PROTOCOL,
@@ -109,10 +116,21 @@ fn exec_without_grant_fails_closed() {
         "request_id": "it-no-grant",
         "operation": "runtime_exec",
         "profile_id": "canary.echo",
+        "timeout_ms": 2000,
+        "max_output_bytes": 1024,
+        "args": ["hello"],
     });
     let resp = host.request(&req);
-    assert_eq!(resp["ok"], false);
-    assert_eq!(resp["error"]["code"], "runtime_grant_missing");
+    assert_eq!(resp["protocol"], PROTOCOL);
+    assert_eq!(resp["request_id"], "it-no-grant");
+    assert_eq!(resp["operation"], "runtime.exec");
+    // Must never be a grant-authority failure: no second grant engine exists.
+    if resp["ok"].as_bool().unwrap_or(false) {
+        assert!(resp["result"]["run_id"].as_str().is_some());
+    } else {
+        assert_ne!(resp["error"]["code"], "runtime_grant_missing");
+        assert_ne!(resp["error"]["code"], "runtime_profile_unknown");
+    }
 }
 
 #[test]
@@ -147,19 +165,18 @@ fn malformed_operation_is_rejected() {
 
 #[test]
 fn exec_with_grant_reaches_profile_boundary() {
-    // This asserts the host accepts a background-issued grant and routes to the
-    // host-owned canary profile's command boundary. Real PTY clean-exit is
-    // demonstrated on CI; here we only require a well-formed, grant-bearing
-    // exec request to return a runtime_exec-shaped envelope (ok OR a bounded
-    // environment/teardown error) rather than an authorization error.
+    // P1C2: grant_id is correlation-only. A well-formed exec request (with or
+    // without the ticket) routes to the host-owned canary profile boundary.
+    // Real PTY clean-exit is demonstrated on CI; here we only require a
+    // runtime_exec-shaped envelope (ok OR a bounded environment/teardown
+    // error) rather than any authorization error.
     let mut host = spawn_host();
     let req = serde_json::json!({
         "protocol": PROTOCOL,
         "version": CONTRACT_VERSION,
         "request_id": "it-grant-echo",
         "operation": "runtime_exec",
-        "grant_id": "grant-abc",
-        "workspace_id": "ws-canary",
+        "grant_id": "lr:req-authorized-123",
         "profile_id": "canary.echo",
         "timeout_ms": 2000,
         "max_output_bytes": 1024,
@@ -169,13 +186,56 @@ fn exec_with_grant_reaches_profile_boundary() {
     assert_eq!(resp["protocol"], PROTOCOL);
     assert_eq!(resp["request_id"], "it-grant-echo");
     assert_eq!(resp["operation"], "runtime.exec");
-    // Must NOT be an authorization failure: a grant was honored.
-    assert_ne!(resp["error"]["code"], "runtime_grant_missing");
-    assert_ne!(resp["error"]["code"], "runtime_profile_unknown");
-    // Either a successful bounded result or an explicit environment blocker.
+    // Must NOT be an authorization failure: background is the sole authority.
     if resp["ok"].as_bool().unwrap_or(false) {
         assert!(resp["result"]["run_id"].as_str().is_some());
         assert!(resp["result"]["bytes_retained"].as_u64().unwrap_or(0) <= 1024);
         assert!(resp["result"]["exit_status"].is_object());
+    } else {
+        assert_ne!(resp["error"]["code"], "runtime_grant_missing");
+        assert_ne!(resp["error"]["code"], "runtime_profile_unknown");
     }
+}
+
+#[test]
+fn production_sleeper_profile_is_not_selectable() {
+    // P1C2 production single: spawn_sleeper is test-internal only and must not
+    // be model-selectable without the explicit test gate.
+    let mut host = spawn_host();
+    let req = serde_json::json!({
+        "protocol": PROTOCOL,
+        "version": CONTRACT_VERSION,
+        "request_id": "it-sleeper-prod",
+        "operation": "runtime_exec",
+        "grant_id": "lr:test",
+        "profile_id": "canary.spawn_sleeper",
+        "timeout_ms": 2000,
+        "max_output_bytes": 1024,
+        "args": [],
+    });
+    let resp = host.request(&req);
+    assert_eq!(resp["ok"], false);
+    assert_eq!(resp["error"]["code"], "runtime_profile_unknown");
+}
+
+#[test]
+fn invalid_workspace_binding_fails_closed() {
+    // P1C2 receiver-owned binding: a relative or missing absolute path is
+    // never trusted and fails closed with workspace_unavailable.
+    let mut host = spawn_host();
+    let req = serde_json::json!({
+        "protocol": PROTOCOL,
+        "version": CONTRACT_VERSION,
+        "request_id": "it-bad-ws",
+        "operation": "runtime_exec",
+        "grant_id": "lr:test",
+        "workspace_id": "relative/path",
+        "profile_id": "canary.echo",
+        "timeout_ms": 2000,
+        "max_output_bytes": 1024,
+        "args": ["hello"],
+    });
+    let resp = host.request(&req);
+    assert_eq!(resp["ok"], false);
+    assert_eq!(resp["error"]["code"], "runtime_workspace_unavailable");
 }

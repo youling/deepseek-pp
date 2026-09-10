@@ -1,16 +1,23 @@
 //! Host-owned operation handler for `runtime.status` and the canary
-//! `runtime.exec` profile.
+//! `runtime.exec` profile (P1C2 final Web-first canary closure).
 //!
-//! Authorization contract: `grant_id`, `workspace_id`, `profile_id`, `args`
-//! are payload/claims bound to the background-issued grant. They never grant
-//! execution by themselves. Only host-owned profiles listed in `profiles()` are
-//! executable; a browser cannot supply an arbitrary command.
+//! Authorization contract (P1C2): the extension background authorization path
+//! is the sole model-tool authorization authority. `grant_id` is a
+//! background-owned internal correlation/audit ticket only — model/page
+//! invisible — and never grants execution by itself. The host never treats a
+//! non-empty string as authorization evidence and does not operate a second
+//! permission/grant engine.
 //!
-//! P1 also requires a non-empty, background-owned `grant_id` to be echoed back
-//! as an authorization marker. This enforces "no direct content/page-to-host
-//! execution path" at the host trust boundary: the host refuses to run the
-//! canary command unless a grant was issued by the extension background before
-//! it calls us.
+//! Only host-owned production profiles listed in `profiles()` are executable
+//! (production: `canary.echo` only); a browser cannot supply an arbitrary
+//! command. `canary.spawn_sleeper` and the `--exit-code`/`--emit-burst`
+//! helpers are test-internal only and never model-selectable production
+//! profiles (gated by `DEEPSEEK_PP_RUNTIME_ALLOW_TEST_PROFILES=1`).
+//!
+//! `workspace_id`, when present, is a background-owned internal binding hint
+//! (receiver-owned), never a model authority claim. The host still
+//! realpath/canonicalizes it, verifies existence/directory, and fails closed;
+//! a browser/model-supplied path is never a trust fact.
 
 use std::time::Duration;
 
@@ -51,11 +58,29 @@ pub fn host_spec() -> HostSpec {
     HostSpec { platform, pty_supported }
 }
 
+/// Production advertisement: only `canary.echo` is model-selectable.
+/// `canary.spawn_sleeper` remains a test-internal helper (real PTY/Job Object
+/// teardown coverage) and is never advertised to the model surface.
 pub fn profiles() -> Vec<String> {
-    vec![
-        CANARY_PROFILE.to_string(),
-        CANARY_SPAWN_SLEEPER_PROFILE.to_string(),
-    ]
+    vec![CANARY_PROFILE.to_string()]
+}
+
+/// Test-internal profile gate (P1B real ConPTY/Job Object coverage without
+/// widening the production model surface).
+fn test_profiles_allowed() -> bool {
+    std::env::var("DEEPSEEK_PP_RUNTIME_ALLOW_TEST_PROFILES")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
+fn is_executable_profile(profile: &str) -> bool {
+    if profile == CANARY_PROFILE {
+        return true;
+    }
+    if profile == CANARY_SPAWN_SLEEPER_PROFILE && test_profiles_allowed() {
+        return true;
+    }
+    false
 }
 
 /// Returns the host-owned executable + args for a profile. The command is
@@ -122,23 +147,14 @@ pub fn handle_status(request: RuntimeRequest) -> Envelope {
 pub fn handle_exec(request: RuntimeRequest) -> Envelope {
     let req_id = request.request_id.clone();
 
-    // Authorization marker: a non-empty grant reference is required. Without a
-    // background-issued grant, the host refuses to run anything.
-    let grant = match request.grant_id {
-        Some(g) if !g.is_empty() => g,
-        _ => {
-            return Envelope::err(
-                req_id,
-                "runtime.exec",
-                "runtime_grant_missing",
-                "No background-issued authorization grant reference was supplied. Direct browser/page calls are refused.".into(),
-                false,
-            );
-        }
-    };
+    // P1C2: grant_id is correlation/audit metadata only, never authorization
+    // evidence. Execution authority lives solely in the extension background
+    // authorization path (capabilityScope). The host does not gate on
+    // non-empty strings and does not run a second grant engine.
+    let grant_correlation = request.grant_id.clone().unwrap_or_default();
 
     let profile = match &request.profile_id {
-        Some(p) if profiles().contains(p) => p.clone(),
+        Some(p) if is_executable_profile(p) => p.clone(),
         _ => {
             return Envelope::err(
                 req_id,
@@ -150,8 +166,10 @@ pub fn handle_exec(request: RuntimeRequest) -> Envelope {
         }
     };
 
-    // The wire's workspace_id is metadata only; the cwd is host-bound,
-    // canonical, and P1C-ready. Model cannot select an absolute path.
+    // P1C2 receiver-owned workspace binding: the wire's workspace_id, when
+    // present, is a background-owned internal hint only. The host still
+    // realpath/canonicalizes, verifies existence/directory, and fails closed.
+    // Model/page payloads never establish workspace authority.
     let workspace_hint = request.workspace_id.clone();
     let workspace_log = workspace_hint.clone().unwrap_or_else(|| "(none)".into());
     let bound_root = match crate::workspace::resolve_for_exec(workspace_hint.as_deref()) {
@@ -190,7 +208,10 @@ pub fn handle_exec(request: RuntimeRequest) -> Envelope {
             args,
             cwd: Some(cwd_str),
             env: vec![
-                ("DEEPSEEK_PP_RUNTIME_GRANT".to_string(), grant),
+                (
+                    "DEEPSEEK_PP_RUNTIME_GRANT".to_string(),
+                    grant_correlation,
+                ),
                 ("DEEPSEEK_PP_RUNTIME_PROFILE".to_string(), profile),
                 ("DEEPSEEK_PP_RUNTIME_WORKSPACE".to_string(), workspace_log),
             ],

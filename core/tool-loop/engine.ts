@@ -1,4 +1,8 @@
 import type { ToolCall, ToolExecutionRecord, ToolResult } from '../types';
+import {
+  projectToolResultForInjection,
+  type ToolResultBudget,
+} from '../tool/result-budget';
 
 export type ToolLoopExecuteTool = (call: ToolCall) => Promise<ToolExecutionRecord>;
 
@@ -86,8 +90,17 @@ function assertContinuationActive<TTurn>(input: ToolContinuationLoopInput<TTurn>
 export function createToolExecutionRecord(
   call: ToolCall,
   result: ToolResult,
-  limits: { detailMaxLength: number; outputMaxLength: number },
+  limits: ToolResultBudget,
 ): ToolExecutionRecord {
+  const projected = projectToolResultForInjection(
+    {
+      detail: result.detail,
+      output: result.output === undefined ? undefined : JSON.stringify(result.output),
+      truncated: result.truncated,
+      truncation: undefined,
+    },
+    limits,
+  );
   return {
     name: result.name ?? call.name,
     provider: result.provider ?? call.provider,
@@ -98,17 +111,11 @@ export function createToolExecutionRecord(
       provider: result.provider,
       descriptorId: result.descriptorId,
       summary: result.summary,
-      detail: clampText(result.detail, limits.detailMaxLength),
-      output: result.output === undefined
-        ? undefined
-        : clampText(JSON.stringify(result.output), limits.outputMaxLength),
-      truncated: result.truncated,
+      detail: projected.detail,
+      output: projected.output,
+      truncated: projected.truncated,
+      truncation: projected.truncation,
       error: result.error,
     },
   };
-}
-
-export function clampText(value: string | undefined, maxLength: number): string | undefined {
-  if (!value) return value;
-  return value.length > maxLength ? `${value.slice(0, maxLength)}\n...[truncated]` : value;
 }

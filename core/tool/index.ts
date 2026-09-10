@@ -25,6 +25,8 @@ export type {
   ToolProviderKind,
   ToolRegistrySnapshot,
   ToolResult,
+  ToolResultField,
+  ToolResultTruncationProvenance,
   ToolRiskLevel,
   RuntimeToolAuthorizationContext,
   ToolGrantExecutionContext,

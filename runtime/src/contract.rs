@@ -51,13 +51,16 @@ pub struct RuntimeRequest {
 }
 
 impl RuntimeRequest {
-    /// Fail-closed validation of the request shape at the trust boundary.
+    /// Fail-closed validation of the request shape at the trust boundary (P1C2).
     ///
-    /// `protocol`, `version`, and `operation` are authoritative. `grant_id`,
-    /// `workspace_id`, `profile_id`, `args` are payload/claims bound to the
-    /// background-issued grant; they are never authorization evidence by
-    /// themselves. The host owner authorizes execution (see `host.rs`), not
-    /// the browser-supplied claims.
+    /// `protocol`, `version`, and `operation` are authoritative. `grant_id` is
+    /// a background-owned internal correlation ticket only (model-invisible),
+    /// never authorization evidence. `workspace_id` is a background-owned
+    /// internal binding hint only (receiver-owned), still canonicalized and
+    /// fail-closed by the host. `profile_id`/`args` are payload claims bound to
+    /// the background grant; they never authorize by themselves. The background
+    /// authorization path is the sole authority (see `host.rs`), not
+    /// browser-supplied claims.
     pub fn validate(&self) -> Result<(), ContractError> {
         if self.protocol != PROTOCOL {
             return Err(ContractError::ProtocolUnknown(self.protocol.clone()));
@@ -67,6 +70,28 @@ impl RuntimeRequest {
         }
         if self.request_id.is_empty() || self.request_id.len() > 128 {
             return Err(ContractError::Invalid("request_id must be a non-empty string <= 128 bytes".into()));
+        }
+        // P1C2: background-owned internal fields are strictly validated shape-wise
+        // but never authorization evidence. grant_id is correlation-only (any
+        // string; the 64 KiB framing ceiling catches oversize). workspace_id is
+        // a background binding hint: non-empty, bounded, no NUL; the host still
+        // canonicalizes and fails closed.
+        if let Some(grant) = &self.grant_id {
+            if grant.contains('\0') {
+                return Err(ContractError::Invalid("grant_id must not contain NUL".into()));
+            }
+        }
+        if let Some(workspace) = &self.workspace_id {
+            if workspace.is_empty() || workspace.len() > 4096 || workspace.contains('\0') {
+                return Err(ContractError::Invalid(
+                    "workspace_id must be a non-empty string <= 4096 bytes without NUL when present".into(),
+                ));
+            }
+        }
+        if let Some(profile) = &self.profile_id {
+            if profile.contains('\0') {
+                return Err(ContractError::Invalid("profile_id must not contain NUL".into()));
+            }
         }
         if self.args.len() > MAX_ARGS_PER_REQUEST {
             return Err(ContractError::Invalid(format!(
