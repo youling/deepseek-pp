@@ -6,11 +6,9 @@
 //! teardown is confirmed.
 
 use std::io::Read;
-use std::process::Stdio;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
-#[cfg(not(windows))]
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use serde::Serialize;
 
@@ -60,18 +58,14 @@ impl Drop for BarrierGuard {
 }
 
 /// PTY-backed, bounded, teardown-confirmed execution.
+///
+/// P1B4: Windows production path is real ConPTY/PTY. The prior piped
+/// `run_bounded_windows` bypass is removed; `run_bounded` always uses the
+/// PTY implementation so gated acceptance directly covers production.
 pub fn run_bounded(options: ExecOptions, cancel: &crate::process_tree::CancelToken) -> Result<RunOutcome, ExecuteError> {
-    #[cfg(windows)]
-    {
-        return run_bounded_windows(options, cancel);
-    }
-    #[cfg(not(windows))]
-    {
-        return run_bounded_pty(options, cancel);
-    }
+    run_bounded_pty(options, cancel)
 }
 
-#[cfg(not(windows))]
 fn run_bounded_pty(options: ExecOptions, cancel: &crate::process_tree::CancelToken) -> Result<RunOutcome, ExecuteError> {
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -111,13 +105,14 @@ fn run_bounded_pty(options: ExecOptions, cancel: &crate::process_tree::CancelTok
         .map_err(|e| ExecuteError::Spawn(format!("spawn: {}", e)))?;
     let pid = child.process_id().unwrap_or(0);
     drop(pair.slave);
-    // Windows ConPTY boundary isolation: ConPTY requires the master writer to
-    // answer the initial Device Status Report (DSR `\x1b[6n`) otherwise the
-    // child hangs and only 4 bytes are observed (CI 34456939702). At the same
-    // time, holding both the original master and a cloned reader blocks
-    // `try_wait` from completing. We take ownership of the master, clone the
-    // reader, take the writer for DSR handling, and drop the original master
-    // handle so only reader+writer remain.
+    // P1B4: keep the PTY master alive for the whole run. Dropping `pair.master`
+    // here destroys the Windows ConPTY pseudoconsole (HPCON) while the child is
+    // still starting, which deterministically fails child startup with
+    // STATUS_DLL_NOT_FOUND (3221225794) and 0 bytes. portable-pty's own example
+    // keeps master alive until after `child.wait()` for this reason. `try_wait`
+    // (GetExitCodeProcess) is not blocked by the extra master handle.
+    // ConPTY still requires the master writer to answer the initial DSR
+    // (`\x1b[6n`); the reader thread below answers with CPR `1;1`.
     let master = pair.master;
     let mut reader = master
         .try_clone_reader()
@@ -125,7 +120,8 @@ fn run_bounded_pty(options: ExecOptions, cancel: &crate::process_tree::CancelTok
     let mut writer = master
         .take_writer()
         .map_err(|e| ExecuteError::Spawn(format!("take_writer: {}", e)))?;
-    drop(master);
+    // `_master_keepalive` must outlive child wait + final drain.
+    let _master_keepalive = master;
 
     let mut guard = crate::process_tree::ProcessTreeGuard::supervise(pid)
         .map_err(|e| ExecuteError::Spawn(format!("supervise: {}", e)))?;
@@ -133,7 +129,7 @@ fn run_bounded_pty(options: ExecOptions, cancel: &crate::process_tree::CancelTok
 
     let max_output = options.max_output_bytes;
 
-    let (tx, rx): (Sender<u8>, Receiver<u8>) = mpsc::channel();
+    let (tx, rx): (mpsc::Sender<u8>, Receiver<u8>) = mpsc::channel();
     std::thread::spawn(move || {
         use std::io::Write;
         let mut buf = [0u8; 4096];
@@ -243,170 +239,6 @@ fn run_bounded_pty(options: ExecOptions, cancel: &crate::process_tree::CancelTok
     }
 }
 
-#[cfg(windows)]
-fn run_bounded_windows(options: ExecOptions, cancel: &crate::process_tree::CancelToken) -> Result<RunOutcome, ExecuteError> {
-    // Windows piped fallback for ConPTY boundary isolation (P1B3).
-    // ConPTY via portable-pty hangs or fails with STATUS_DLL_NOT_FOUND for
-    // canary helper on some Windows hosts (observed as 4-byte DSR-only
-    // output and 3221225794 exit). The piped path retains the same
-    // Job-Object ownership and bounded-output semantics but uses plain
-    // std::process::Command pipes, which are VT-unaware and always flush.
-    let barrier_path_buf = {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let p = std::env::temp_dir().join(format!(
-            "deepseek-pp-runtime-barrier-{}-{}-{}.ready",
-            std::process::id(),
-            nanos,
-            crate::util::next_barrier_counter()
-        ));
-        let _ = std::fs::remove_file(&p);
-        p
-    };
-    let barrier_guard = BarrierGuard(Some(barrier_path_buf.clone()));
-    let barrier_env = (BARRIER_ENV.to_string(), barrier_path_buf.to_string_lossy().into_owned());
-
-    // On Windows, canary helper must be hosted via `cmd /C` when using
-    // piped execution as well? No, piped does not need ConPTY, so we can
-    // run the helper directly. Keep the same wrapping logic as
-    // `pty_wrap_if_needed` for consistency, but for piped we run directly
-    // (no ConPTY, so no DSR issue). Use the original program/args as-is
-    // except for absolute `cmd` resolution.
-    let (prog, args) = {
-        #[cfg(windows)]
-        {
-            let comspec = std::env::var("ComSpec").unwrap_or_else(|_| r"C:\Windows\System32\cmd.exe".to_string());
-            let is_canary = options.program.contains("deepseek-pp-local-runtime") && options.args.first().map(|s| s.starts_with("--")).unwrap_or(false);
-            if is_canary {
-                let mut v = vec!["/C".to_string(), options.program.clone()];
-                v.extend(options.args.clone());
-                (comspec, v)
-            } else if options.program.eq_ignore_ascii_case("cmd") {
-                (comspec, options.args.clone())
-            } else {
-                (options.program.clone(), options.args.clone())
-            }
-        }
-        #[cfg(not(windows))]
-        {
-            (options.program.clone(), options.args.clone())
-        }
-    };
-
-    let mut cmd = std::process::Command::new(&prog);
-    cmd.args(&args);
-    if let Some(cwd) = &options.cwd {
-        cmd.current_dir(cwd);
-    }
-    for (k, v) in &options.env {
-        cmd.env(k, v);
-    }
-    cmd.env(barrier_env.0.clone(), barrier_env.1.clone());
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-    cmd.stdin(Stdio::null());
-
-    let mut child = cmd.spawn().map_err(|e| ExecuteError::Spawn(format!("spawn: {}", e)))?;
-    let pid = child.id();
-    let mut guard = crate::process_tree::ProcessTreeGuard::supervise(pid)
-        .map_err(|e| ExecuteError::Spawn(format!("supervise: {}", e)))?;
-    let _ = std::fs::write(&barrier_path_buf, b"ready");
-
-    let stdout = child.stdout.take().ok_or_else(|| ExecuteError::Spawn("no stdout".into()))?;
-    let stderr = child.stderr.take().ok_or_else(|| ExecuteError::Spawn("no stderr".into()))?;
-    let max_output = options.max_output_bytes;
-    let (tx, rx) = mpsc::channel();
-    let tx1 = tx.clone();
-    let tx2 = tx.clone();
-    drop(tx);
-    std::thread::spawn(move || {
-        let mut reader = stdout;
-        let mut buf = [0u8; 4096];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    for b in &buf[..n] {
-                        if tx1.send(*b).is_err() { return; }
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
-            }
-        }
-    });
-    std::thread::spawn(move || {
-        let mut reader = stderr;
-        let mut buf = [0u8; 4096];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    for b in &buf[..n] {
-                        if tx2.send(*b).is_err() { return; }
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
-            }
-        }
-    });
-
-    let deadline = std::time::Instant::now() + options.timeout;
-    let mut buffer: Vec<u8> = Vec::new();
-    let mut bytes_seen: u64 = 0;
-    let mut timed_out = false;
-    loop {
-        if cancel.is_cancelled() {
-            return teardown_mid_run(&mut guard, &rx, &mut buffer, &mut bytes_seen, max_output, false, true, barrier_guard);
-        }
-        if std::time::Instant::now() >= deadline && !timed_out {
-            timed_out = true;
-        }
-        drain_available(&rx, &mut buffer, &mut bytes_seen, max_output);
-        if let Ok(b) = rx.recv_timeout(Duration::from_millis(5)) {
-            bytes_seen += 1;
-            if buffer.len() < max_output {
-                buffer.push(b);
-            }
-            drain_available(&rx, &mut buffer, &mut bytes_seen, max_output);
-        }
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                drain_final(&rx, &mut buffer, &mut bytes_seen, max_output);
-                let (exit_code, signal_name) = status_to_code_std(&status);
-                if let Err(e) = guard.confirm_clean_exit() {
-                    drop(barrier_guard);
-                    return Err(ExecuteError::UnconfirmedTeardown(format!("clean-exit teardown not confirmed: {}", e)));
-                }
-                drop(barrier_guard);
-                return Ok(RunOutcome {
-                    timed_out,
-                    cancelled: false,
-                    exit_code,
-                    signal_name,
-                    teardown_confirmed: guard.is_confirmed(),
-                    bytes_seen,
-                    output: String::from_utf8_lossy(&buffer).to_string(),
-                });
-            }
-            Ok(None) => {}
-            Err(e) => {
-                drain_final(&rx, &mut buffer, &mut bytes_seen, max_output);
-                drop(barrier_guard);
-                return Err(ExecuteError::UnconfirmedTeardown(format!("try_wait failed: {} (teardown not confirmed)", e)));
-            }
-        }
-        if timed_out {
-            // Ensure child is terminated via Job, then drain
-            let _ = child.kill();
-            return teardown_mid_run(&mut guard, &rx, &mut buffer, &mut bytes_seen, max_output, true, false, barrier_guard);
-        }
-    }
-}
-
 fn teardown_mid_run(
     guard: &mut crate::process_tree::ProcessTreeGuard,
     rx: &Receiver<u8>,
@@ -503,15 +335,6 @@ fn status_to_code(status: &portable_pty::ExitStatus) -> (Option<i64>, Option<Str
     let code = status.exit_code() as i64;
     let signal = status.signal().map(|s| s.to_string());
     (Some(code), signal)
-}
-
-#[cfg(windows)]
-fn status_to_code_std(status: &std::process::ExitStatus) -> (Option<i64>, Option<String>) {
-    if status.success() {
-        return (Some(0), None);
-    }
-    let code = status.code().map(|c| c as i64);
-    (code, None)
 }
 
 #[cfg(test)]
@@ -705,6 +528,10 @@ mod tests {
         diagnostic_pty_boundary(false);
     }
 
+    // P1B4: Windows-only diagnostics are explicitly isolated so Linux
+    // `cargo test --all-targets` and `-- --ignored` never attempt `cmd` or
+    // `C:\Windows...` paths.
+    #[cfg(windows)]
     #[test]
     #[ignore = "P1B3 diagnostic cmd echo PTY"]
     fn diagnostic_cmd_echo_pty() {
@@ -714,6 +541,7 @@ mod tests {
         println!("[DIAG CMD] pid={:?} bytes_seen={} retained={} exit={:?} output_contains={}", info.pid, info.bytes_seen, info.retained, info.exit_code, info.output_contains_hello);
     }
 
+    #[cfg(windows)]
     #[test]
     #[ignore = "P1B3 diagnostic simple PTY no guard"]
     fn diagnostic_simple_pty_no_guard() {
@@ -775,12 +603,9 @@ mod tests {
         let label = if with_job { "C" } else { "B" };
         let bin = host_bin();
         println!("[DIAG {}] binary={} with_job={}", label, bin, with_job);
-        // P1B3: B is the first failing boundary (PTY without Job). On this
-        // host, direct PTY for canary helper fails with STATUS_DLL_NOT_FOUND
-        // (3221225794) and 0 bytes, while the piped fallback (production
-        // `run_bounded_windows`) succeeds. We log the boundary without
-        // panicking so that `cargo test -- --ignored` still passes for the
-        // original gated suite; the log is auditable for CI.
+        // P1B4: B/C remain test-only instrumentation. They assert real PTY
+        // boundaries (no log-only success) but never substitute for the
+        // production `run_bounded` acceptance tests above.
         let mut any_fail = false;
         for (name, args, timeout) in [
             ("echo", vec!["--echo-canary".to_string(), "hello-canary".to_string()], Duration::from_secs(10)),
@@ -851,8 +676,8 @@ mod tests {
             }
         }
         if any_fail {
-            println!("[DIAG {}] BOUNDARY FAIL with_job={} (first failing boundary is B, see log)", label, with_job);
-            println!("[DIAG {}] Note: production `run_bounded_windows` (piped) succeeds for these helpers; see gated tests.", label);
+            println!("[DIAG {}] BOUNDARY FAIL with_job={}", label, with_job);
+            panic!("[DIAG {}] PTY boundary failed with_job={} (see log above)", label, with_job);
         } else {
             println!("[DIAG {}] PASS all boundary checks (with_job={})", label, with_job);
         }
@@ -896,16 +721,15 @@ mod tests {
         }
 
         drop(pair.slave);
-        // Windows ConPTY isolation: clone reader, take writer for DSR, then
-        // drop master so `try_wait` is not blocked by an extra master handle
-        // (see production `run_bounded` fix). Writer is needed to answer DSR.
+        // P1B4: keep master alive for the whole diagnostic run. Dropping it
+        // here closes the ConPTY HPCON while the child starts and yields
+        // STATUS_DLL_NOT_FOUND (3221225794). See production `run_bounded_pty`.
         let master = pair.master;
         let mut reader = master.try_clone_reader().map_err(|e| format!("try_clone_reader: {}", e))?;
         let mut writer = master.take_writer().map_err(|e| format!("take_writer: {}", e))?;
-        drop(master);
+        let _master_keepalive = master;
 
-        // Optionally assign to Job (C) or not (B) – after master drop so Job
-        // assignment timing matches production path.
+        // Optionally assign to Job (C) or not (B).
         let mut job_opt: Option<crate::process_tree::ProcessTreeGuard> = None;
         let mut job_active_initial: Option<u64> = None;
         if with_job {
