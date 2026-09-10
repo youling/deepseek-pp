@@ -416,6 +416,12 @@ interface ActiveToolBlockSession {
   executions: ToolExecutionRecord[];
   createdAt: number;
   updatedAt: number;
+  /**
+   * Receiver-owned commit state. `false` for live streaming sessions until
+   * the matching `RESPONSE_COMPLETE` commits the native DeepSeek response.
+   * Restored sessions are considered committed at ingress.
+   */
+  responseCommitted: boolean;
 }
 
 interface PendingStartedToolCall {
@@ -1327,6 +1333,8 @@ async function dispatchMainWorldMessage(
           ? [...session.executions]
           : [...toolExecutions];
         if (session && session.executions.length > 0) {
+          session.responseCommitted = true;
+          renderToolBlock(session);
           await persistToolBlockSession(session, complete.text, complete);
           const renderedBlock =
             (findRestoredToolBlock(session.id) as HTMLElement | null) ??
@@ -1340,12 +1348,19 @@ async function dispatchMainWorldMessage(
           }
         } else if (toolExecutions.length > 0) {
           const fallbackSession = getCurrentRouteActiveToolBlockSession();
-          if (fallbackSession)
+          if (fallbackSession) {
+            fallbackSession.responseCommitted = true;
+            const fallbackExecutions = fallbackSession.executions;
+            if (fallbackExecutions.length === 0 && toolExecutions.length > 0) {
+              fallbackSession.executions = [...toolExecutions];
+            }
+            renderToolBlock(fallbackSession);
             await persistToolBlockSession(
               fallbackSession,
               complete.text,
               complete,
             );
+          }
           collapseToolBlock(toolBlockEl);
           toolExecutions = [];
           toolBlockEl = null;
@@ -1365,9 +1380,11 @@ async function dispatchMainWorldMessage(
           pendingToolAuthorizationCorrelations.terminate(requestId);
           await waitForPendingToolExecutions(requestId);
           await finalizeInterruptedToolStarts(requestId);
+          discardUncommittedToolBlockSessionsForRequest(requestId);
           await closeContentToolAuthorization(requestId);
         } else {
           pendingToolAuthorizationCorrelations.terminate(requestId);
+          discardUncommittedToolBlockSessionsForRequest(requestId);
         }
         break;
       }
@@ -2004,6 +2021,7 @@ async function closeAllContentToolAuthorizations(): Promise<void> {
     [...activeToolAuthorizations.keys()].map(async (requestId) => {
       await waitForPendingToolExecutions(requestId);
       await finalizeInterruptedToolStarts(requestId);
+      discardUncommittedToolBlockSessionsForRequest(requestId);
       await closeContentToolAuthorization(requestId);
     }),
   );
@@ -5606,6 +5624,30 @@ async function finalizeInterruptedToolStarts(requestId: string): Promise<void> {
   await finalizePendingToolStarts(pending);
 }
 
+function discardUncommittedToolBlockSessionsForRequest(
+  requestId: string,
+): void {
+  const authoritativeRequestId = activeToolAuthorizations.has(requestId)
+    ? requestId
+    : (toolAuthorizationRequestAliases.get(requestId) ?? requestId);
+
+  for (const [id, session] of activeToolBlockSessions) {
+    if (
+      session.responseCommitted ||
+      (session.requestId !== requestId &&
+        session.requestId !== authoritativeRequestId)
+    ) {
+      continue;
+    }
+    activeToolBlockSessions.delete(id);
+    if (activeToolBlockSessionId === id) {
+      activeToolBlockSessionId = null;
+      toolExecutions = [];
+      toolBlockEl = null;
+    }
+  }
+}
+
 async function finalizePendingToolStarts(
   pending: PendingStartedToolCall[],
 ): Promise<void> {
@@ -5632,7 +5674,8 @@ async function finalizePendingToolStarts(
     activeStreamingToolCount = Math.max(0, activeStreamingToolCount - 1);
     activeToolBlockSessionId = session.id;
     toolExecutions = session.executions;
-    renderToolBlock(session);
+    // Interrupted tool truth is persisted, but terminal/error paths do not
+    // grant presentation commit. Only RESPONSE_COMPLETE may do that.
     await persistToolBlockSession(session);
     showPetResult(result);
   }
@@ -6566,6 +6609,7 @@ function getOrCreateActiveToolBlockSession(
     executions: [],
     createdAt: now,
     updatedAt: now,
+    responseCommitted: false,
   };
   activeToolBlockSessions.set(id, session);
   return session;
@@ -6660,7 +6704,7 @@ async function persistToolBlockSession(
     "tool execution block write",
     upsertPersistedToolExecutionBlock(block),
   );
-  if (toolCapabilityScope?.active) {
+  if (toolCapabilityScope?.active && session.responseCommitted) {
     restoredToolRecords.set(block.id, block);
     pendingRestoredToolRecordIds.add(block.id);
     scheduleRenderRestoredToolBlocks();
@@ -7638,6 +7682,15 @@ function isToolBlockSessionOnCurrentRoute(
   return session.url === getToolBlockUrl();
 }
 
+function isAnyActiveToolBlockSessionUncommitted(): boolean {
+  for (const session of activeToolBlockSessions.values()) {
+    if (!session.responseCommitted && isToolBlockSessionOnCurrentRoute(session)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function renderToolBlock(
   session: ActiveToolBlockSession = getActiveToolBlockSession() ?? {
     id: "",
@@ -7649,11 +7702,16 @@ function renderToolBlock(
     executions: toolExecutions,
     createdAt: Date.now(),
     updatedAt: Date.now(),
+    responseCommitted: false,
   },
   options?: { skipCleanup?: boolean },
 ) {
   if (session.executions.length === 0) return;
   if (!isToolBlockSessionOnCurrentRoute(session)) return;
+  // Live-stream guard: never mutate DeepSeek-owned response DOM while the
+  // native response is still uncommitted. Presentation is deferred until
+  // RESPONSE_COMPLETE commits the session.
+  if (!session.responseCommitted) return;
 
   injectToolBlockStyles();
 
@@ -8613,6 +8671,9 @@ function hasLikelyToolMarkerPrefix(text: string): boolean {
 }
 
 function cleanRenderedToolCalls() {
+  // Fail closed for uncommitted live responses: never mutate DeepSeek-owned
+  // response DOM while the native stream is still uncommitted.
+  if (isAnyActiveToolBlockSessionUncommitted()) return;
   const roots = getToolCleanupRoots();
   for (const root of roots) {
     hideInlineAgentContinuationMessages(root);
